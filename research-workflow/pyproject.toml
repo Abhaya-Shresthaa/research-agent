@@ -1,0 +1,9 @@
+[project]
+name = "research-workflow"
+version = "0.0.1"
+description = "Research-workflow - Python port"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["src"]
+python_files = "test_*.py"

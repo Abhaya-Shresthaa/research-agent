@@ -1,0 +1,42 @@
+# Output files
+output.md
+report.md
+answer.md
+
+# Dependencies
+node_modules
+.pnp
+.pnp.js
+venv/
+env/
+
+# Local env files
+.env*
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Testing
+coverage
+.pytest_cache
+htmlcov/
+
+# Build Outputs
+.next/
+out/
+build
+dist
+*.pyc
+__pycache__/
+
+# Debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Misc
+.DS_Store
+*.pem
+bun.lockb
+*.egg-info/

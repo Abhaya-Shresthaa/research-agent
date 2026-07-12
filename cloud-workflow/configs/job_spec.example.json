@@ -1,0 +1,32 @@
+{
+  "job_id": "runtime-generated-job",
+  "objective": "Train and evaluate a model. The exact task, code, dataset layout, and metrics may change per request.",
+  "task_type": "dynamic",
+  "dataset": {
+    "local_paths": [],
+    "description": "Optional. Add local files or folders here when a dataset is available before runtime.",
+    "container_data_dir": "/workspace/data"
+  },
+  "runtime": {
+    "python_version": "3.11",
+    "framework": "pytorch",
+    "accelerator": "cpu",
+    "image": "abhaya123/pytorch-cpu:latest",
+    "entrypoint": "generated/script.py",
+    "outputs_dir": "/outputs",
+    "workspace_dir": "/workspace"
+  },
+  "extra_packages": [],
+  "expected_outputs": [
+    "metrics.json"
+  ],
+  "llm_instructions": [
+    "Generate only generated/script.py and structured runtime metadata.",
+    "Do not generate a Dockerfile or requirements.txt; extra packages belong in structured metadata.",
+    "The generated payload will be statically analyzed and reviewed by a second LLM before execution.",
+    "Preserve explicit user requirements exactly, including framework, accelerator, epoch count, dataset, metrics, and expected artifacts.",
+    "The container must write all artifacts to /outputs.",
+    "If no dataset is supplied, the script must either create a small synthetic dataset or fail with a clear message explaining what data is required.",
+    "Keep paths generic. Do not assume dog_vs_cat, cats, dogs, training_set, or test_set unless the job spec explicitly asks for them."
+  ]
+}
