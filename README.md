@@ -71,17 +71,16 @@ AMD DevCloud is a GPU cloud platform (compatible with the DigitalOcean API) that
 ### Setup
 
 ```bash
-# 1. Clone and enter the project
-cd final_amd
+# 1. Clone the repository
+git clone https://github.com/Abhaya-Shresthaa/research-agent.git
+cd research-agent
 
 # 2. Create virtual environment
 python3 -m venv finalENV
 source finalENV/bin/activate
 
-# 3. Install dependencies
+# 3. Install all dependencies (both agents, single install)
 pip install -r requirements.txt
-cd research-workflow && pip install -r requirements.txt && cd ..
-cd cloud-workflow && pip install -r requirements.txt && cd ..
 
 # 4. Configure environment
 cp .env.example .env
@@ -137,74 +136,132 @@ Select from the menu:
 ## Project Structure
 
 ```
-final_amd/
+research-agent/                              # Root (cloned from GitHub)
 │
-├── main.py                          # Unified Orchestrator entry point
-├── .env                             # Centralized environment variables
-├── .env.example                     # Environment template
-├── requirements.txt                 # Root dependencies
+├── main.py                                  # Unified Orchestrator entry point
+├── .env                                     # Centralized environment variables
+├── .env.example                             # Environment template
+├── .gitignore                               # Git ignore rules
+├── requirements.txt                         # All dependencies (both agents merged into root)
 │
-├── outputs/                         # Generated outputs (reports, answers)
-│   ├── report.md                    # Research report
-│   ├── answer.md                    # Research answer
-│   ├── final-report.md              # Synthesized combined report
-│   └── <job_id>/                    # Shifted cloud experiment outputs
+├── outputs/                                 # Generated outputs (reports, answers)
+│   ├── report.md                            # Research report (option 1)
+│   ├── answer.md                            # Research answer (option 1)
+│   ├── final-report.md                      # Synthesized combined report (option 3)
+│   └── <job_id>/                            # Shifted cloud experiment outputs
 │
-├── generated_files/                 # Shifted cloud workspaces
+├── generated_files/                         # Shifted cloud workspaces
 │   └── <job_id>/
 │
-├── user_resources/                  # User-provided assets
-│   ├── uploading_data/              # Permanent local dataset staging
-│   └── user_script/                 # User-provided .py reference scripts
+├── user_resources/                          # User-provided assets
+│   ├── uploading_data/                      # Permanent local dataset staging
+│   └── user_script/                         # User-provided .py reference scripts
 │
-├── research-workflow/               # Deep Research Agent
-│   ├── requirements.txt
-│   ├── pyproject.toml
+├── research-workflow/                       # Deep Research Agent
+│   ├── pyproject.toml                       # Python project metadata
+│   ├── .gitignore                           # Research-specific ignores
 │   ├── src/
-│   │   ├── api.py                   # Flask REST API server
-│   │   ├── deep_research.py         # Core recursive research engine
-│   │   ├── feedback.py              # Follow-up question generation
-│   │   ├── prompt.py                # System prompt for research LLM
-│   │   ├── run.py                   # Standalone CLI for research
-│   │   ├── test_deep_research.py    # Unit tests
-│   │   └── ai/
-│   │       ├── providers.py         # OpenAI/Fireworks client setup
-│   │       └── text_splitter.py     # Recursive text splitting
-│   └── .gitignore
+│   │   ├── __init__.py                      # Package marker
+│   │   ├── deep_research.py                 # Core recursive research engine
+│   │   ├── feedback.py                      # Follow-up question generation
+│   │   ├── prompt.py                        # System prompt for research LLM
+│   │   ├── run.py                           # Standalone CLI
+│   │   ├── api.py                           # Flask REST API server
+│   │   ├── test_deep_research.py            # Unit tests for deep_research
+│   │   └── ai/                              # AI/LLM integration layer
+│   │       ├── providers.py                 # OpenAI/Fireworks client + trim_prompt
+│   │       ├── text_splitter.py             # RecursiveCharacterTextSplitter
+│   │       └── test_text_splitter.py        # Unit tests for text splitter
 │
-├── cloud-workflow/                  # Cloud Experiment Agent
-│   ├── requirements.txt
-│   ├── .env.example
-│   ├── run.py                       # Interactive cloud workflow entry point
+├── cloud-workflow/                          # Cloud Experiment Agent
+│   ├── run.py                               # Interactive CLI entry point
 │   ├── configs/
-│   │   └── job_spec.example.json
-│   ├── dynamic_cloud/               # Core orchestration package
-│   │   ├── amd_droplet.py           # Droplet lifecycle (DevCloud API)
-│   │   ├── config.py                # Settings dataclasses + env loading
-│   │   ├── dataset_config.py        # Dataset normalization + HF ID resolution
-│   │   ├── docker_runner.py         # RemoteHostRunner (SSH operations)
-│   │   ├── executor.py              # AMD execution + report synthesis
-│   │   ├── llm_client.py            # LLM JSON helpers + robust parser
-│   │   ├── llm_generator.py         # Non-interactive LLM generation
-│   │   ├── payload_quality.py       # Static analyzer + review/fix prompts
-│   │   ├── runtime_layers.py        # Image catalog, metadata, helpers
-│   │   ├── vm_options.py            # GPU catalog, pricing, image selection
-│   │   └── workspace.py             # Local workspace management
+│   │   └── job_spec.example.json            # Example job spec for --spec mode
+│   ├── dynamic_cloud/                       # Core orchestration package
+│   │   ├── __init__.py                      # Package docstring
+│   │   ├── amd_droplet.py                   # Droplet lifecycle (DevCloud API)
+│   │   ├── config.py                        # AmdSettings/LlmSettings + env loading
+│   │   ├── dataset_config.py                # Dataset normalization + HF resolution
+│   │   ├── docker_runner.py                 # RemoteHostRunner (SSH operations)
+│   │   ├── executor.py                      # AMD execution + report synthesis
+│   │   ├── llm_client.py                    # LLM JSON call helpers + parser
+│   │   ├── llm_generator.py                 # Non-interactive LLM generation
+│   │   ├── payload_quality.py               # Static analyzer + review/fix prompts
+│   │   ├── runner.py                        # Non-interactive CLI (--spec --generate --execute)
+│   │   ├── runtime_layers.py                # Image catalog, metadata, runtime helpers
+│   │   ├── vm_options.py                    # GPU catalog, pricing, image selection
+│   │   └── workspace.py                     # Local workspace management
 │   ├── model/
-│   │   ├── __init__.py
-│   │   └── model.py                 # CentralModel over OpenAI client
-│   ├── runtime_workspace/           # Per-job working directories
-│   ├── outputs/                     # Downloaded experiment results
-│   └── tests/                       # Unit tests
+│   │   ├── __init__.py                      # Lazily exports model1, model2, make_model
+│   │   └── model.py                         # CentralModel over OpenAI client
+│   ├── runtime_workspace/                   # Per-job working directories (gitignored)
+│   ├── outputs/                             # Downloaded experiment results (gitignored)
+│   └── tests/                               # Unit tests
+│       ├── __init__.py
+│       ├── test_amd_droplet.py
+│       ├── test_config.py
+│       ├── test_docker_runner.py
+│       ├── test_executor.py
+│       ├── test_run_image_selection.py
+│       ├── test_runtime_dependency_checks.py
+│       └── test_runtime_validator.py
 │
-└── finalENV/                        # Python virtual environment
+└── finalENV/                                # Python virtual environment (gitignored)
 ```
 
 ---
 
 ## Workflow 1: Deep Research Agent
 
-The Deep Research Agent is a Python adaptation of the "Open Deep Research" pattern. It uses an LLM to generate search queries, scrapes web content via Firecrawl, extracts learnings, and recursively deepens the investigation.
+The Deep Research Agent lives in `research-workflow/` and is a Python adaptation of the "Open Deep Research" pattern. It uses an LLM to generate search queries, scrapes web content via [Firecrawl](https://www.firecrawl.dev/), extracts learnings, and recursively deepens the investigation.
+
+### Module Map
+
+| File | Responsibility |
+|------|---------------|
+| `src/deep_research.py` | Core research engine — Pydantic models, SERP generation, result processing, report writing, recursive loop |
+| `src/feedback.py` | Generates follow-up clarification questions via LLM |
+| `src/prompt.py` | System prompt skeleton with current date for the research LLM |
+| `src/api.py` | Flask REST API server (`/api/research`, `/api/generate-report`) |
+| `src/run.py` | Standalone CLI entry point (used independently of `main.py`) |
+| `src/ai/providers.py` | OpenAI client setup, `trim_prompt()` with tiktoken |
+| `src/ai/text_splitter.py` | `RecursiveCharacterTextSplitter` for prompt truncation |
+
+### Pydantic Models (`deep_research.py`)
+
+```python
+SerpQuery:
+  query: str                   # Search query string
+  research_goal: str           # Why this query is being made
+
+SerpQueriesResponse:
+  queries: list[SerpQuery]     # Collection of generated queries
+
+ResearchImage:
+  image_url: str               # URL of the image
+  alt_text: str                # Alt text from markdown
+  source_url: str              # Page the image was found on
+  context: str                 # Surrounding text explaining the image
+  relevance: str               # LLM-generated relevance explanation
+
+ProcessResult:
+  learnings: list[str]         # Extracted knowledge items
+  follow_up_questions: list[str]  # Questions for deeper research
+  relevant_images: list[ResearchImage]  # Curated image selections
+
+ResearchResult:
+  learnings: list[str]         # All learnings from this branch
+  visited_urls: list[str]      # All URLs visited in this branch
+  relevant_images: list[ResearchImage]  # Deduplicated images
+
+FinalAnswerResponse:
+  exact_answer: str            # Concise answer text
+
+FinalReportResponse:
+  report_markdown: str         # Full report in markdown
+```
+
+String coercion validators handle dict-type learnings (preserving metadata), and image lists accept both `ResearchImage` objects and bare URLs.
 
 ### Research Pipeline
 
@@ -212,69 +269,101 @@ The Deep Research Agent is a Python adaptation of the "Open Deep Research" patte
 User Query
     │
     ▼
-[Feedback Phase] — LLM generates 3 follow-up questions
-    │  User answers → combined_query = initial + Q&A
+[Feedback Phase] — generate_feedback() produces 3 follow-up questions
+    │  User answers → combined_query = "Initial Query: ...\nQ: ...\nA: ..."
     ▼
 [Deep Research Loop] — recursive breadth × depth tree
     │
-    ├── Step 1: LLM generates SERP queries (breadth = N)
-    │     → returns [{query, research_goal}, ...]
+    ├── 1. _generate_serp_queries() — LLM generates search queries
+    │     → returns up to `breadth` SerpQuery objects
+    │     → injects previous learnings for specificity
     │
-    ├── Step 2: For each query, Firecrawl.search() with 15s timeout
-    │     → returns pages with markdown content
+    ├── 2. _run_query() — Firecrawl.search() per query
+    │     → 15s timeout, limit=5, format=markdown
+    │     → normalized from v2 SearchData response schema
     │
-    ├── Step 3: Process SERP results via LLM
-    │     → extracts learnings (up to 3 per page)
-    │     → generates follow-up questions (up to 3 per page)
-    │     → selects relevant images from page markdown
+    ├── 3. _process_serp_result() — LLM processes each result
+    │     → extracts up to 3 learnings (dense, information-rich)
+    │     → generates up to 3 follow-up questions
+    │     → selects relevant images with context + relevance
     │
-    └── Step 4: If depth > 1, recurse with follow-up questions
+    └── 4. If depth > 0 → recurse()
           breadth' = (breadth + 1) // 2
           depth' = depth - 1
-          → merges learnings and images up the call stack
+          → follow-up directions become the next query
+          → learnings, URLs, images merged from all branches
 ```
 
 ### Recursive Search Strategy
 
-The `deep_research()` function implements a configurable breadth × depth search tree:
-
 | Parameter | Description | Default | Range |
 |-----------|-------------|---------|-------|
-| `breadth` | Number of parallel SERP queries per level | 4 | 2–10 |
+| `breadth` | Parallel SERP queries per recursion level | 4 | 2–10 |
 | `depth` | Recursion depth of follow-up research | 2 | 1–5 |
 
-At each recursion level:
-- Breadth is halved (`(breadth + 1) // 2`) — wider at the top, narrower in follow-ups
-- Learnings from all branches merged with `set()` deduplication
-- URLs unioned and deduplicated
-- Images pass through URL-based deduplication
+At each recursion level breadth is halved (`(breadth + 1) // 2`) — wider at the top, narrower in deeper follow-ups. Learnings, URLs, and images are deduplicated when merging back up the call stack.
 
-### Concurrency Model
+### Concurrency & Resilience
 
-- Up to 2 concurrent Firecrawl requests (`FIRECRAWL_CONCURRENCY=2`)
+- Up to 2 concurrent Firecrawl requests (configurable via `FIRECRAWL_CONCURRENCY=2`)
 - Controlled via `asyncio.Semaphore`
 - Requests timeout at 15 seconds
-- Failed queries return empty `ResearchResult` — they don't fail the whole research
+- Individual query failures return empty `ResearchResult` — they don't abort the entire research tree
 
-### Image Extraction & Deduplication
+### Image Extraction Pipeline
 
-1. **Candidate Extraction** — `_extract_image_candidates()` scans markdown for `![alt](url)` patterns (up to 8 per page, 40 total), capturing ±700 chars of surrounding context
-2. **LLM Selection** — The `_process_serp_result()` LLM call selects genuinely relevant images with a relevance explanation
-3. **Deduplication** — `_dedupe_images()` removes duplicate URLs
-4. **Report Embedding** — `write_final_report()` embeds selected images inline. Images the LLM omitted from the report text are appended in a "Relevant Images" section.
+1. **Candidate Extraction** — `_extract_image_candidates()` scans scraped markdown with regex `!\[([^\]]*)\]\(([^)]+)\)`:
+   - Up to 8 images per page, 40 total
+   - ±700 characters of surrounding context captured
+   - Data URIs and duplicates (by URL) are skipped
+
+2. **LLM Curation** — The `_process_serp_result()` LLM call receives candidates as structured XML and selects only genuinely relevant images, outputting a relevance explanation for each
+
+3. **Deduplication** — `_dedupe_images()` removes duplicate URLs across all branches
+
+4. **Report Embedding** — `write_final_report()` passes images to the LLM as structured `<image>` XML for inline embedding. Any images the LLM omits from the report body are appended in a "Relevant Images" section (max 10)
 
 ### Report Synthesis
 
 Two output modes, both using `response_format={"type": "json_object"}` with Pydantic-validated JSON:
 
-| Mode | LLM Prompt | Output |
-|------|-----------|--------|
-| **Answer** | "as concise as possible — usually just a few words or maximum a sentence" | Short, focused answer |
-| **Report** | "as detailed as possible, aim for 3 or more pages, include ALL the learnings" | Comprehensive report with images and sources |
+| Mode | Function | LLM Instruction | Output | File |
+|------|----------|----------------|--------|------|
+| **Answer** | `write_final_answer()` | "as concise as possible — usually just a few words or maximum a sentence" | Short, focused answer | `outputs/answer.md` |
+| **Report** | `write_final_report()` | "as detailed as possible, aim for 3 or more pages, include ALL the learnings" | Comprehensive report with images + sources | `outputs/report.md` |
 
-### REST API Server
+The report includes a `## Sources` section with all visited URLs, and optionally a `## Relevant Images` appendix.
 
-The research module also runs as a standalone Flask server:
+### LLM System Prompt (`prompt.py`)
+
+The research LLM receives a system prompt that:
+- States the current date in ISO format
+- Treats the user as a "highly experienced analyst" — no simplification needed
+- Encourages high detail, organization, and proactive suggestions
+- Welcomes speculation and contrarian ideas when flagged
+- Prioritizes good arguments over authoritative sources
+
+### Text Processing (`ai/text_splitter.py`, `ai/providers.py`)
+
+**`trim_prompt()`** — ensures prompts fit within `CONTEXT_SIZE` (default 128K tokens):
+1. Encodes with `tiktoken` (`o200k_base`)
+2. If over limit, trims by ~3 chars per overflow token
+3. Passes through `RecursiveCharacterTextSplitter` which splits on `\n\n` → `\n` → `.` → `,` → ` ` → `""`
+4. Recursively trims until within limits (minimum 140 chars)
+
+### Standalone CLI (`run.py`)
+
+Run independently without the orchestrator:
+
+```bash
+cd research-workflow
+pip install -e .
+python src/run.py
+```
+
+Same interactive flow: query → breadth/depth → follow-up questions → research → report/answer.
+
+### REST API Server (`api.py`)
 
 ```bash
 cd research-workflow
@@ -282,9 +371,10 @@ python src/api.py
 # Deep Research API running on port 3051
 ```
 
-Endpoints:
-- `POST /api/research` — runs research, returns answer + learnings + URLs + images
-- `POST /api/generate-report` — runs research, returns full Markdown report
+| Endpoint | Method | Body | Returns |
+|----------|--------|------|---------|
+| `/api/research` | POST | `{"query": "...", "depth": 3, "breadth": 3}` | JSON with answer, learnings, URLs, images |
+| `/api/generate-report` | POST | `{"query": "...", "depth": 3, "breadth": 3}` | Raw Markdown report |
 
 ---
 
@@ -560,4 +650,3 @@ python -m unittest discover -v
 - Quality gate rejects payloads with CUDA packages, dataset download logic, or hallucinated imports
 - Private key permissions validated before use (`chmod 600`)
 - Protected environment keys cannot be overridden by `.env`
-# research-agent
