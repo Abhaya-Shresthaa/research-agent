@@ -65,7 +65,7 @@ AMD DevCloud is a GPU cloud platform (compatible with the DigitalOcean API) that
 
 - Python 3.10+
 - An [AMD DevCloud](https://www.amd.com/en/developer/devcloud.html) account with API access
-- A [Firecrawl](https://www.firecrawl.dev/) API key for web scraping (can get it for free by signing up)
+- A [Firecrawl](https://www.firecrawl.dev/) API key for web scraping (can get free credits by signing)
 - A [Fireworks AI](https://fireworks.ai/) API key (or any OpenAI-compatible API key)
 
 ### Setup
