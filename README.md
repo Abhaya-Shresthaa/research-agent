@@ -1,4 +1,4 @@
-# Unified Orchestrator — Deep Research + Cloud Experiment on AMD GPU
+# Intelligent Research and Cloud Experimentation
 
 > **A dual-agent system combining LLM-powered deep web research with automated ML training orchestration on AMD MI300X GPU cloud infrastructure.**
 
