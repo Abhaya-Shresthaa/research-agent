@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime
 import os
 import sys
 from pathlib import Path
@@ -84,7 +85,7 @@ _cloud_check_user_script = _cloud_run._check_user_script
 
 # Cloud public helpers
 from dynamic_cloud.runtime_layers import select_image, normalize_framework, validate_local_image_support
-from dynamic_cloud.workspace import prepare_workspace, safe_job_id, validate_payload, normalize_dataset_config
+from dynamic_cloud.workspace import prepare_workspace, safe_job_id, validate_payload, normalize_dataset_config, create_run_dir
 from dynamic_cloud.runtime_layers import write_layered_payload
 from dynamic_cloud.config import AmdDropletSession
 from dynamic_cloud.vm_options import select_amd_image, validate_vm_accelerator, vm_option_for_size
@@ -118,7 +119,7 @@ def _ask(question: str) -> str:
 
 
 def _log(*args, **kwargs):
-    print(*args, **kwargs)
+    pass
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +139,13 @@ async def _run_research_workflow(
     breadth: int,
     depth: int,
     is_report: bool,
+    run_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Execute the deep research pipeline and return results."""
+    """Execute the deep research pipeline and return results.
+
+    When ``run_dir`` is provided, the report/answer is written into that
+    per-execution folder; otherwise it falls back to ``_BASE_DIR/outputs/``.
+    """
     combined_query = initial_query
 
     if is_report:
@@ -171,7 +177,7 @@ async def _run_research_workflow(
     _log("\nResearch complete.")
     _log("Writing final output...")
 
-    outputs_dir = _BASE_DIR / "outputs"
+    outputs_dir = run_dir if run_dir is not None else (_BASE_DIR / "outputs")
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
     if is_report:
@@ -183,8 +189,8 @@ async def _run_research_workflow(
         )
         report_path = outputs_dir / "report.md"
         report_path.write_text(report, encoding="utf-8")
-        print(f"\nReport has been saved to {report_path}")
-        return {"type": "report", "path": str(report_path), "learnings": len(result.learnings), "urls": len(result.visited_urls)}
+        _log(f"\nReport has been saved to {report_path}")
+        return {"type": "report", "path": str(report_path), "learnings": len(result.learnings), "urls": len(result.visited_urls), "run_dir": str(run_dir) if run_dir else None}
     else:
         answer = write_final_answer(
             prompt=combined_query,
@@ -192,8 +198,8 @@ async def _run_research_workflow(
         )
         answer_path = outputs_dir / "answer.md"
         answer_path.write_text(answer, encoding="utf-8")
-        print(f"\nAnswer has been saved to {answer_path}")
-        return {"type": "answer", "path": str(answer_path), "learnings": len(result.learnings), "urls": len(result.visited_urls)}
+        _log(f"\nAnswer has been saved to {answer_path}")
+        return {"type": "answer", "path": str(answer_path), "learnings": len(result.learnings), "urls": len(result.visited_urls), "run_dir": str(run_dir) if run_dir else None}
 
 
 async def _research_interactive() -> dict[str, Any]:
@@ -201,6 +207,13 @@ async def _research_interactive() -> dict[str, Any]:
     _log_research_start(_research_model_id())
 
     initial_query = _ask("What would you like to research? ")
+    if not initial_query.strip():
+        print("No topic entered. Exiting.")
+        return {"status": "cancelled"}
+
+    # Per-execution folder for this run's research output.
+    run_dir = create_run_dir(_BASE_DIR / "outputs", initial_query)
+    print(f"\nRun folder: {run_dir.relative_to(_BASE_DIR)}")
 
     breadth_raw = _ask("Enter research breadth (recommended 2-10, default 4): ")
     breadth = int(breadth_raw) if breadth_raw.strip().isdigit() else 4
@@ -213,7 +226,7 @@ async def _research_interactive() -> dict[str, Any]:
         != "answer"
     )
 
-    return await _run_research_workflow(initial_query, breadth, depth, is_report)
+    return await _run_research_workflow(initial_query, breadth, depth, is_report, run_dir=run_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +264,14 @@ def _cloud_interactive() -> dict[str, Any]:
     _cloud_apply_existing_droplet(selected_vm, None, None)
     validate_vm_accelerator(selected_vm, selected_accelerator)
 
+    # Per-execution run folder, named from the LLM job_title (short slug) +
+    # <MM-DD-HHMM>. Created after the questions so the title is available.
+    run_dir = create_run_dir(
+        _BASE_DIR / "outputs",
+        str(questions_payload.get("job_title") or user_requirement),
+    )
+    print(f"\nRun folder: {run_dir.relative_to(_BASE_DIR)}")
+
     return _cloud_continue_flow(
         user_requirement=user_requirement,
         selected_framework=selected_framework,
@@ -261,6 +282,7 @@ def _cloud_interactive() -> dict[str, Any]:
         answers=answers,
         has_user_script=has_user_script,
         user_script_content=user_script_content,
+        run_dir=run_dir,
     )
 
 
@@ -275,8 +297,19 @@ def _cloud_continue_flow(
     answers: dict[str, str],
     has_user_script: bool = False,
     user_script_content: str = "",
+    run_now: bool | None = None,
+    keep_vm_choice: bool | None = None,
+    non_interactive: bool = False,
+    run_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Shared post-questions cloud workflow logic (called by option 2 and option 3)."""
+    """Shared post-questions cloud workflow logic (called by option 2 and option 3).
+
+    ``run_now`` / ``keep_vm_choice`` let callers pre-collect the two execution
+    decisions (option 3) so the parallel phase never blocks on ``input()`` from
+    a worker thread. When ``None`` (option 2), the original interactive
+    ``_cloud_confirm`` prompts are used. When ``non_interactive`` is set, the
+    dataset-inspection-failure fallback auto-cancels instead of prompting.
+    """
     job_id = safe_job_id(str(questions_payload.get("job_title") or "dynamic-job"))
     dataset_metadata: dict[str, Any] | None = None
     inspection_session: AmdDropletSession | None = None
@@ -321,9 +354,15 @@ def _cloud_continue_flow(
                 selected_accelerator,
                 selected_dataset,
                 selected_vm,
+                run_dir=run_dir,
             )
         except RuntimeError as exc:
             print(f"\n[WARNING] Dataset inspection failed: {exc}")
+            if non_interactive:
+                # Parallel/unattended mode (option 3): cannot prompt from a
+                # worker thread. Match the prompt's default (False → cancel).
+                print("Cloud workflow cancelled (non-interactive: dataset inspection failed).")
+                return {"status": "cancelled", "reason": "dataset inspection failed"}
             fallback = _cloud_confirm(
                 "Continue with no external dataset instead?", default=False
             )
@@ -369,7 +408,7 @@ def _cloud_continue_flow(
     runtime["image"] = select_image(selected_framework, selected_accelerator)
     validate_local_image_support(selected_framework, selected_accelerator)
 
-    workspace = prepare_workspace(job_spec, reset=dataset_metadata is None)
+    workspace = prepare_workspace(job_spec, run_dir=run_dir, reset=dataset_metadata is None)
     if not dataset_metadata and workspace.payload_dir.joinpath("dataset_metadata.json").exists():
         try:
             dataset_metadata = json.loads(workspace.payload_dir.joinpath("dataset_metadata.json").read_text(encoding="utf-8"))
@@ -398,7 +437,7 @@ def _cloud_continue_flow(
         print(f"\nAMD Cloud setup is not ready yet: {exc}")
         print(f"\nPrepared files were still written here: {workspace.payload_dir}")
         print("Fix the AMD configuration, then run this script again.")
-        return {"status": "prepared", "workspace": str(workspace.root)}
+        return {"status": "prepared", "workspace": str(workspace.root), "run_dir": str(run_dir) if run_dir else None}
 
     estimated_minutes = job_spec.get("estimated_runtime_minutes")
     if estimated_minutes:
@@ -414,24 +453,33 @@ def _cloud_continue_flow(
         if vm_already_running
         else "Start AMD GPU Droplet and run training now?"
     )
-    if not _cloud_confirm(run_prompt):
+    if run_now is not None:
+        proceed = run_now
+        print(f"\n{run_prompt} {'yes' if proceed else 'no'} (pre-selected)")
+    else:
+        proceed = _cloud_confirm(run_prompt)
+    if not proceed:
         print(f"\nPrepared files only. You can inspect them here: {workspace.payload_dir}")
         print(f"\nTo execute later run:\n  python run.py --execute-prepared {workspace.root}")
         if inspection_session:
             _cloud_cleanup_vm(workspace, selected_vm, inspection_session)
-        return {"status": "prepared", "workspace": str(workspace.root)}
+        return {"status": "prepared", "workspace": str(workspace.root), "run_dir": str(run_dir) if run_dir else None}
 
-    keep_vm = (
-        bool(inspection_session and not inspection_session.created_for_dataset_inspection)
-        or (
-            False
-            if vm_already_running
-            else _cloud_confirm(
-                "Keep the Droplet after the run for debugging? (billing continues)",
-                default=False,
+    if keep_vm_choice is not None and not vm_already_running:
+        keep_vm = keep_vm_choice
+        print(f"\nKeep the Droplet after the run? {'yes' if keep_vm else 'no'} (pre-selected)")
+    else:
+        keep_vm = (
+            bool(inspection_session and not inspection_session.created_for_dataset_inspection)
+            or (
+                False
+                if vm_already_running
+                else _cloud_confirm(
+                    "Keep the Droplet after the run for debugging? (billing continues)",
+                    default=False,
+                )
             )
         )
-    )
     _cloud_execute_on_amd(
         workspace,
         job_spec,
@@ -445,6 +493,7 @@ def _cloud_continue_flow(
         "status": "completed",
         "job_id": workspace.job_id,
         "workspace": str(workspace.root),
+        "run_dir": str(run_dir) if run_dir else None,
     }
 
 
@@ -488,6 +537,26 @@ async def _run_both_workflows() -> dict[str, Any]:
     selected_vm["vm_name"] = node_name
     _cloud_apply_existing_droplet(selected_vm, None, None)
     validate_vm_accelerator(selected_vm, selected_accelerator)
+
+    # Per-execution folder shared by both workflows, named from the LLM
+    # job_title (short slug) + <MM-DD-HHMM>. Created after Phase 1 so the
+    # title is available. Research writes report.md here, cloud writes
+    # runtime_generated/ + outputs/ here, and the unified final-report.md is
+    # generated here.
+    run_dir = create_run_dir(
+        _BASE_DIR / "outputs",
+        str(questions_payload.get("job_title") or query),
+    )
+    print(f"\nRun folder: {run_dir.relative_to(_BASE_DIR)}")
+
+    # ── Execution decisions are made interactively in the cloud flow ──
+    # The "Continue on the same AMD Droplet and run training now?" and
+    # "Keep the Droplet after the run?" prompts are asked (y/n) at execution
+    # time inside _cloud_continue_flow — after dataset inspection, when the
+    # cost estimate is known and the droplet exists — rather than pre-collected
+    # here. Pre-collecting (with default=no) silently locked the run-now
+    # decision to "no" if the user pressed Enter, skipping training. Now the
+    # user is asked y/n (default yes); "no" yields the prepared-files-only path.
 
     print(f"\n{'─' * 56}")
     print(f"  Phase 2 — Research Agent Questions")
@@ -533,7 +602,7 @@ async def _run_both_workflows() -> dict[str, Any]:
         _log("\nResearch complete.")
         _log("Writing final output...")
 
-        outputs_dir = _BASE_DIR / "outputs"
+        outputs_dir = run_dir
         outputs_dir.mkdir(parents=True, exist_ok=True)
 
         if is_report:
@@ -545,7 +614,7 @@ async def _run_both_workflows() -> dict[str, Any]:
             )
             report_path = outputs_dir / "report.md"
             report_path.write_text(report, encoding="utf-8")
-            print(f"\n[Research] Report saved to {report_path}")
+            _log(f"\n[Research] Report saved to {report_path}")
             return {"type": "report", "path": str(report_path), "learnings": len(result.learnings), "urls": len(result.visited_urls)}
         else:
             answer = write_final_answer(
@@ -554,11 +623,11 @@ async def _run_both_workflows() -> dict[str, Any]:
             )
             answer_path = outputs_dir / "answer.md"
             answer_path.write_text(answer, encoding="utf-8")
-            print(f"\n[Research] Answer saved to {answer_path}")
+            _log(f"\n[Research] Answer saved to {answer_path}")
             return {"type": "answer", "path": str(answer_path), "learnings": len(result.learnings), "urls": len(result.visited_urls)}
 
     def _cloud_task():
-        """Run cloud pipeline with pre-gathered inputs."""
+        """Run cloud pipeline with pre-gathered inputs (unattended)."""
         return _cloud_continue_flow(
             user_requirement=query,
             selected_framework=selected_framework,
@@ -569,6 +638,12 @@ async def _run_both_workflows() -> dict[str, Any]:
             answers=answers,
             has_user_script=has_user_script,
             user_script_content=user_script_content,
+            # run_now / keep_vm_choice intentionally omitted so the cloud flow
+            # prompts "run training now?" / "keep the Droplet?" interactively
+            # at execution time. non_interactive=True only auto-cancels the
+            # rare dataset-inspection-failure fallback (its default is no).
+            non_interactive=True,
+            run_dir=run_dir,
         )
 
     # Run both concurrently — research is native async, cloud is sync via to_thread
@@ -605,14 +680,30 @@ async def _run_both_workflows() -> dict[str, Any]:
             print(f"  Job ID: {cloud_result.get('job_id')}")
             print(f"  Workspace: {cloud_result.get('workspace')}")
 
-    # ── Combined final report (both workflows complete) ──────────
+    # ── Combined final report (only when the cloud task completed) ──────
+    # F2: previously this ran _generate_final_report("") when the cloud task
+    # failed, resolving to a bogus outputs/outputs path and producing a
+    # research-only report without flagging the cloud failure. Now we only
+    # synthesize the combined report when the cloud agent actually completed,
+    # and surface the failure clearly otherwise.
     print()
-    cloud_job_id = cloud_result.get("job_id", "") if isinstance(cloud_result, dict) else ""
-    _generate_final_report(cloud_job_id)
+    cloud_status = cloud_result.get("status") if isinstance(cloud_result, dict) else "error"
+    final_report_status = "skipped"
+    if cloud_status == "completed":
+        cloud_job_id = cloud_result.get("job_id", "")
+        final_report_status = _generate_final_report(cloud_job_id, run_dir=run_dir)
+    else:
+        print("[Final Report] Skipping combined final report — the Cloud Experiment Agent did not complete.")
+        if isinstance(research_result, dict) and research_result.get("path"):
+            print(f"  Research output is available at: {research_result.get('path')}")
+        if isinstance(cloud_result, dict) and cloud_result.get("workspace"):
+            print(f"  Prepared cloud files: {cloud_result.get('workspace')}")
 
     return {
         "research": research_result,
         "cloud": cloud_result,
+        "final_report_status": final_report_status,
+        "run_dir": str(run_dir),
     }
 
 
@@ -641,41 +732,64 @@ def _show_menu():
         print("Please enter 1, 2, or 3.")
 
 
-def _generate_report_standalone() -> None:
-    """Standalone: detect available cloud job IDs and user query, generate final report."""
-    outputs_dir = _BASE_DIR / "outputs"
-    outputs_dir.mkdir(parents=True, exist_ok=True)
+def _generate_report_standalone() -> str:
+    """Standalone: detect available run folders and (re)generate a final report.
 
-    # ── Detect available cloud job IDs ──────────────────────────
-    job_ids: list[str] = []
-    for entry in sorted(outputs_dir.iterdir()):
-        if entry.is_dir() and (entry / "outputs").is_dir():
-            job_ids.append(entry.name)
+    Scans ``final_amd/outputs/`` for per-execution run folders (the new layout):
+    a folder qualifies if it has an ``outputs/`` subdir (cloud experiment
+    artifacts) **or** a ``runtime_generated/job_spec.json`` (prepared payload).
 
-    if not job_ids:
-        print(f"\nNo cloud experiment outputs found in {outputs_dir.relative_to(_BASE_DIR)}/.")
-        print("Run the Cloud Experiment (option 2) first to produce outputs.")
-        return
+    Returns the final-report status (``ok``/``skipped``/``failed``) so the
+    caller can reflect it in the exit banner / return code (F3).
+    """
+    outputs_root = _BASE_DIR / "outputs"
+    outputs_root.mkdir(parents=True, exist_ok=True)
 
-    # ── Pick job ────────────────────────────────────────────────
-    print(f"\nDetected cloud experiment job(s):")
-    for i, jid in enumerate(job_ids, 1):
-        print(f"  [{i}] {jid}")
+    # ── Detect available run folders ────────────────────────────
+    run_folders: list[Path] = []
+    for entry in sorted(outputs_root.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("."):
+            continue
+        has_outputs = (entry / "outputs").is_dir()
+        has_payload = (entry / "runtime_generated" / "job_spec.json").exists()
+        if has_outputs or has_payload:
+            run_folders.append(entry)
+
+    if not run_folders:
+        print("\nNo cloud experiment run folders found.")
+        print(f"  Checked: {outputs_root.relative_to(_BASE_DIR)}/")
+        print("Run the Cloud Experiment (option 2) first to produce a run folder.")
+        return "skipped"
+
+    # ── Pick run folder ─────────────────────────────────────────
+    print(f"\nDetected cloud experiment run folder(s):")
+    for i, folder in enumerate(run_folders, 1):
+        print(f"  [{i}] {folder.name}")
     print(f"  [0] Cancel")
 
     while True:
-        raw = input("\nSelect a job: ").strip()
+        raw = input("\nSelect a run folder: ").strip()
         if raw == "0":
             print("Cancelled.")
-            return
-        if raw.isdigit() and 1 <= int(raw) <= len(job_ids):
-            selected_job_id = job_ids[int(raw) - 1]
+            return "skipped"
+        if raw.isdigit() and 1 <= int(raw) <= len(run_folders):
+            selected = run_folders[int(raw) - 1]
             break
-        print(f"Enter a number between 0 and {len(job_ids)}.")
+        print(f"Enter a number between 0 and {len(run_folders)}.")
 
-    # ── Generate report ─────────────────────────────────────────
+    # ── Generate report inside the selected run folder ──────────
+    # job_id is read from the prepared job_spec if present (cosmetic — only
+    # used in log lines), else the folder name.
+    job_spec_path = selected / "runtime_generated" / "job_spec.json"
+    if job_spec_path.exists():
+        try:
+            job_id = json.loads(job_spec_path.read_text(encoding="utf-8")).get("job_id", selected.name)
+        except (json.JSONDecodeError, OSError):
+            job_id = selected.name
+    else:
+        job_id = selected.name
     print()
-    _generate_final_report(selected_job_id)
+    return _generate_final_report(str(job_id), run_dir=selected)
 
 
 # ---------------------------------------------------------------------------
@@ -683,12 +797,28 @@ def _generate_report_standalone() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def main():
+def _print_exit_banner(report_status: str) -> None:
+    """Print the closing banner, reflecting final-report status (F3).
+
+    Previously every path printed a plain "Done." even when the capstone
+    final-report LLM call had failed, leaving the user with no signal that the
+    report was missing. Now a failed report produces a warning banner.
+    """
+    print(f"\n{'=' * 56}")
+    if report_status == "failed":
+        print(f"  Done with warnings — final report generation FAILED.")
+        print(f"  See [Final Report] messages above; other artifacts were still saved.")
+    else:
+        print(f"  Done.")
+    print(f"{'=' * 56}\n")
+
+
+async def main() -> int:
     parser = argparse.ArgumentParser(description="Unified Orchestrator — Deep Research + Cloud Experiment")
     parser.add_argument(
         "--generate-report",
         action="store_true",
-        help="Read existing outputs/report.md and cloud artifacts to generate final-report.md",
+        help="Read an existing run folder's report.md and cloud artifacts to (re)generate final-report.md inside it",
     )
     parser.add_argument(
         "--gen-report",
@@ -698,13 +828,12 @@ async def main():
     args, _ = parser.parse_known_args()
 
     if args.generate_report or args.gen_report:
-        _generate_report_standalone()
-        print(f"\n{'=' * 56}")
-        print(f"  Done.")
-        print(f"{'=' * 56}\n")
-        return
+        report_status = _generate_report_standalone()
+        _print_exit_banner(report_status)
+        return 1 if report_status == "failed" else 0
 
     choice = _show_menu()
+    report_status = "skipped"
 
     # Single unified query
     if choice == 1:
@@ -712,19 +841,26 @@ async def main():
     elif choice == 2:
         result = _cloud_interactive()
         if isinstance(result, dict) and result.get("status") == "completed":
-            print()
-            _generate_final_report(result.get("job_id", ""))
+            _rd = result.get("run_dir")
+            if _rd:
+                print()
+                report_status = _generate_final_report(
+                    result.get("job_id", ""),
+                    run_dir=Path(_rd),
+                )
     elif choice == 3:
-        await _run_both_workflows()
+        both = await _run_both_workflows()
+        if isinstance(both, dict):
+            report_status = both.get("final_report_status", "skipped")
 
-    print(f"\n{'=' * 56}")
-    print(f"  Done.")
-    print(f"{'=' * 56}\n")
+    _print_exit_banner(report_status)
+    return 1 if report_status == "failed" else 0
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        _exit_code = asyncio.run(main())
     except KeyboardInterrupt:
         print("\nInterrupted.")
         sys.exit(130)
+    sys.exit(_exit_code)

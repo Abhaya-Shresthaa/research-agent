@@ -349,10 +349,17 @@ class AmdDropletManager:
                     self.droplet_id = None
                     return
                 resp.raise_for_status()
+            except KeyboardInterrupt:
+                # User pressed Ctrl-C during destroy — ignore and keep retrying.
+                # The destroy MUST complete to stop billing.
+                print(f"\n(Destroy in progress — please wait, this stops billing)")
             except requests.exceptions.RequestException as exc:
                 if attempt < 3:
                     print(f"Destroy attempt {attempt} failed: {exc}. Retrying in 10s...")
-                    time.sleep(10)
+                    try:
+                        time.sleep(10)
+                    except KeyboardInterrupt:
+                        print(f"\n(Destroy in progress — please wait, this stops billing)")
                     continue
                 raise
 

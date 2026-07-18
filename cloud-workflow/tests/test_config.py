@@ -113,6 +113,50 @@ class AmdSettingsTests(unittest.TestCase):
                 with self.assertRaisesRegex(PermissionError, "chmod 600"):
                     load_amd_settings()
 
+    # ── D2: raised / configurable timeout defaults ────────────────────────
+
+    def test_default_ssh_and_provisioning_timeouts_are_raised(self) -> None:
+        with mock.patch.dict(os.environ, {"AMD_API_KEY": "token"}, clear=True), mock.patch(
+            "dynamic_cloud.config.load_environment"
+        ), mock.patch("dynamic_cloud.config._validate_ssh_private_key"):
+            settings = load_amd_settings()
+
+        self.assertEqual(settings.wait_ssh_timeout_sec, 600)
+        self.assertEqual(settings.wait_provisioning_timeout_sec, 600)
+
+    def test_timeouts_are_configurable_via_env(self) -> None:
+        env = {
+            "AMD_API_KEY": "token",
+            "AMD_SSH_WAIT_TIMEOUT_SEC": "120",
+            "AMD_PROVISIONING_WAIT_TIMEOUT_SEC": "900",
+            "AMD_DROPLET_WAIT_TIMEOUT_SEC": "300",
+        }
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch(
+            "dynamic_cloud.config.load_environment"
+        ), mock.patch("dynamic_cloud.config._validate_ssh_private_key"):
+            settings = load_amd_settings()
+
+        self.assertEqual(settings.wait_ssh_timeout_sec, 120)
+        self.assertEqual(settings.wait_provisioning_timeout_sec, 900)
+        self.assertEqual(settings.wait_droplet_timeout_sec, 300)
+
+    # ── D6: skip_ssh_validation for cleanup-only paths ────────────────────
+
+    def test_skip_ssh_validation_allows_missing_key(self) -> None:
+        # A non-existent key path would normally fail validation; with
+        # skip_ssh_validation=True the cleanup path must still load settings.
+        env = {"AMD_API_KEY": "token", "AMD_SSH_PRIVATE_KEY_PATH": "/definitely/does/not/exist/key"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("dynamic_cloud.config.load_environment"):
+            settings = load_amd_settings(skip_ssh_validation=True)
+
+        self.assertEqual(settings.api_key, "token")
+
+    def test_skip_ssh_validation_false_still_validates_key(self) -> None:
+        env = {"AMD_API_KEY": "token", "AMD_SSH_PRIVATE_KEY_PATH": "/definitely/does/not/exist/key"}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch("dynamic_cloud.config.load_environment"):
+            with self.assertRaises((FileNotFoundError, PermissionError, RuntimeError)):
+                load_amd_settings(skip_ssh_validation=False)
+
 
 if __name__ == "__main__":
     unittest.main()

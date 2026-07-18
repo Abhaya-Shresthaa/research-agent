@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 import subprocess
+from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
 
@@ -174,6 +176,193 @@ class RemoteHostRunnerTests(unittest.TestCase):
             runner._wait_for_stable_ssh("203.0.113.10")
 
         self.assertEqual(run.call_count, 4)
+
+    # ── D2: configurable SSH / provisioning timeouts ──────────────────────
+
+    def test_wait_for_ssh_ready_attempts_derived_from_settings(self) -> None:
+        # wait_ssh_timeout_sec=30 → clamped to 60s → 60//10 = 6 attempts.
+        settings = SimpleNamespace(
+            admin_user="root",
+            ssh_private_key_path="/tmp/key",
+            wait_ssh_timeout_sec=30,
+        )
+        runner = RemoteHostRunner(settings)
+        refused = subprocess.CompletedProcess(["ssh"], 255, "", "Connection refused")
+
+        with mock.patch("dynamic_cloud.docker_runner.subprocess.run", return_value=refused) as run, mock.patch(
+            "dynamic_cloud.docker_runner.time.sleep"
+        ):
+            with self.assertRaises(TimeoutError):
+                runner._wait_for_ssh_ready("203.0.113.10")
+
+        self.assertEqual(run.call_count, 6)
+
+    def test_wait_for_provisioning_attempts_derived_from_settings(self) -> None:
+        # wait_provisioning_timeout_sec=120 → 120//10 = 12 attempts.
+        settings = SimpleNamespace(
+            admin_user="root",
+            ssh_private_key_path="/tmp/key",
+            wait_provisioning_timeout_sec=120,
+        )
+        runner = RemoteHostRunner(settings)
+        # Banner still present → never ready.
+        still_waiting = subprocess.CompletedProcess(["ssh"], 0, "Please wait while we get your droplet ready\n", "")
+
+        with mock.patch("dynamic_cloud.docker_runner.subprocess.run", return_value=still_waiting) as run, mock.patch(
+            "dynamic_cloud.docker_runner.time.sleep"
+        ):
+            with self.assertRaises(TimeoutError):
+                runner._wait_for_provisioning("203.0.113.10")
+
+        self.assertEqual(run.call_count, 12)
+
+    def test_wait_for_provisioning_succeeds_when_banner_gone(self) -> None:
+        settings = SimpleNamespace(
+            admin_user="root",
+            ssh_private_key_path="/tmp/key",
+            wait_provisioning_timeout_sec=600,
+        )
+        runner = RemoteHostRunner(settings)
+        ready = subprocess.CompletedProcess(["ssh"], 0, "SSHD_READY\n", "")
+
+        with mock.patch("dynamic_cloud.docker_runner.subprocess.run", return_value=ready) as run, mock.patch(
+            "dynamic_cloud.docker_runner.time.sleep"
+        ):
+            runner._wait_for_provisioning("203.0.113.10")
+
+        self.assertEqual(run.call_count, 1)
+
+    # ── D3: probe 0 — AMD Quick Start conda path ──────────────────────────
+
+    def test_discover_remote_python_quick_conda_path(self) -> None:
+        settings = SimpleNamespace(admin_user="root", ssh_private_key_path="/tmp/key")
+        runner = RemoteHostRunner(settings)
+
+        def fake_ssh(_ip: str, command: str, **_kwargs):
+            # Probe 0 first path succeeds.
+            if "/opt/conda/envs/pytorch/bin/python3" in command:
+                return subprocess.CompletedProcess(["ssh"], 0, "1\n", "")
+            return subprocess.CompletedProcess(["ssh"], 1, "", "")
+
+        with mock.patch.object(runner, "_ssh", side_effect=fake_ssh):
+            py = runner._discover_remote_python("203.0.113.10")
+
+        self.assertEqual(py, "/opt/conda/envs/pytorch/bin/python3")
+        self.assertEqual(runner._remote_python, "/opt/conda/envs/pytorch/bin/python3")
+
+    def test_discover_remote_python_falls_through_when_quick_path_missing(self) -> None:
+        settings = SimpleNamespace(admin_user="root", ssh_private_key_path="/tmp/key")
+        runner = RemoteHostRunner(settings)
+
+        def fake_ssh(_ip: str, command: str, **_kwargs):
+            # Probe 0 paths fail, probe 1 (system python3) succeeds.
+            if "python3 -c 'import torch" in command and "/opt/conda" not in command:
+                return subprocess.CompletedProcess(["ssh"], 0, "1\n", "")
+            return subprocess.CompletedProcess(["ssh"], 1, "", "")
+
+        with mock.patch.object(runner, "_ssh", side_effect=fake_ssh):
+            py = runner._discover_remote_python("203.0.113.10")
+
+        self.assertEqual(py, "python3")
+
+    # ── D4: download_outputs packs on the VM, scp's the tarball, then extracts ──
+
+    def test_download_outputs_packs_scps_and_extracts(self) -> None:
+        settings = SimpleNamespace(admin_user="root", ssh_private_key_path="/tmp/key")
+        runner = RemoteHostRunner(settings)
+        captured: dict = {"ssh_cmds": [], "scp": None, "extract": None}
+
+        def fake_ssh(_ip, command, **_kwargs):
+            captured["ssh_cmds"].append(command)
+            # Pack command reports a 1234-byte tarball size via `stat`.
+            if command.startswith("cd ") and "stat -c %s" in command:
+                return subprocess.CompletedProcess(["ssh"], 0, "1234\n", "")
+            return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+        def fake_run(cmd, **kwargs):
+            # The scp invocation — copy the "remote" tarball to the local path.
+            if cmd and cmd[0] == "scp":
+                captured["scp"] = cmd
+                local_path = Path(cmd[-1])
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_bytes(b"x" * 1234)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        def fake_subprocess_run(cmd, **kwargs):
+            captured["extract"] = cmd
+            # Simulate tar extracting `outputs/run_manifest.json` into -C target.
+            extract_dir = Path(cmd[cmd.index("-C") + 1])
+            (extract_dir / "outputs").mkdir(parents=True, exist_ok=True)
+            (extract_dir / "outputs" / "run_manifest.json").write_text("{}")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        _run_dir = Path(tempfile.mkdtemp())
+        workspace = SimpleNamespace(
+            job_id="job-x",
+            payload_dir=Path("/tmp/payload"),
+            outputs_dir=_run_dir / "outputs",
+        )
+
+        with mock.patch.object(runner, "_ssh", side_effect=fake_ssh), \
+             mock.patch.object(runner, "_run", side_effect=fake_run), \
+             mock.patch("dynamic_cloud.docker_runner.subprocess.run",
+                        side_effect=fake_subprocess_run):
+            result = runner.download_outputs("203.0.113.10", workspace, "/root/dynamic_jobs/job")
+
+        # 1. Remote pack: tar to a *file* (not stdout `-`), stderr to a file,
+        #    and a `stat -c %s` to report the tarball size.
+        pack_cmd = captured["ssh_cmds"][0]
+        self.assertIn("tar -czf ", pack_cmd)
+        self.assertNotIn("tar -czf -", pack_cmd)
+        self.assertIn("outputs.tar.gz", pack_cmd)
+        self.assertIn("2>/tmp/dc_tar_pack.err", pack_cmd)
+        self.assertIn("stat -c %s", pack_cmd)
+
+        # 2. scp fetches the remote tarball to a local .part file.
+        self.assertIsNotNone(captured["scp"])
+        self.assertEqual(captured["scp"][0], "scp")
+        self.assertIn("outputs.tar.gz", captured["scp"][-2])
+        self.assertTrue(captured["scp"][-1].endswith("outputs.tar.gz.part"))
+
+        # 3. Local extraction uses the downloaded file (not stdin `-`).
+        self.assertEqual(captured["extract"][0], "tar")
+        self.assertEqual(captured["extract"][1], "-xzf")
+        self.assertNotEqual(captured["extract"][2], "-")
+
+        # 4. Outputs land in the run folder's outputs/ dir and the path returns.
+        self.assertTrue((_run_dir / "outputs" / "run_manifest.json").exists())
+        self.assertEqual(result, _run_dir / "outputs")
+
+        # 5. The .part tarball is cleaned up locally after extraction.
+        self.assertFalse((_run_dir / "outputs.tar.gz.part").exists())
+
+    # ── D7: banner suppression is non-destructive ─────────────────────────
+
+    def test_silence_shell_banner_backs_up_bashrc_and_avoids_system_files(self) -> None:
+        settings = SimpleNamespace(admin_user="root", ssh_private_key_path="/tmp/key")
+        runner = RemoteHostRunner(settings)
+        captured: dict = {}
+
+        def fake_ssh(_ip, command, **_kwargs):
+            captured["cmd"] = command
+            return subprocess.CompletedProcess(["ssh"], 0, "", "")
+
+        with mock.patch.object(runner, "_ssh", side_effect=fake_ssh):
+            runner._silence_shell_banner("203.0.113.10")
+
+        cmd = captured["cmd"]
+        # Back up the original ~/.bashrc once, BEFORE overwriting it.
+        self.assertIn("cp ~/.bashrc ~/.bashrc.dc_backup", cmd)
+        self.assertIn("[ ! -f ~/.bashrc.dc_backup ]", cmd)
+        # New bashrc sources the backup (the user's real config) for interactive shells.
+        self.assertIn("~/.bashrc.dc_backup", cmd)
+        self.assertIn("return", cmd)  # early return for non-interactive shells
+        # Must NOT mutate system files (the old destructive approach).
+        self.assertNotIn("sed -i", cmd)
+        self.assertNotIn("/etc/profile.d", cmd)
+        self.assertNotIn("chmod -x", cmd)
+        self.assertNotIn("/etc/update-motd.d", cmd)
 
 
 if __name__ == "__main__":

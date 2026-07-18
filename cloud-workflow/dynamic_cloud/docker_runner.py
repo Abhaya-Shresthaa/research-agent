@@ -13,7 +13,7 @@ import shlex
 import subprocess
 import time
 
-from dynamic_cloud.config import AmdSettings, LOCAL_OUTPUTS_DIR
+from dynamic_cloud.config import AmdSettings
 from dynamic_cloud.runtime_layers import dataset_package_install_code
 from dynamic_cloud.workspace import JobWorkspace
 
@@ -230,6 +230,21 @@ class RemoteHostRunner:
 
         print("  🔎 Probing remote host for a Python with torch...", flush=True)
 
+        # ── Probe 0: common AMD Quick Start conda path ──
+        # The PyTorch Quick Start image (amddevelopercloud-pytorch2100rocm724)
+        # ships torch inside this conda environment — check it first before
+        # running the slower discovery probes.
+        for quick_path in (
+            "/opt/conda/envs/pytorch/bin/python3",
+            "/opt/conda/bin/python3",
+        ):
+            qr = self._ssh(ip, f"test -x {quick_path} && {quick_path} -c 'import torch; print(1)'",
+                          capture=True, check=False, timeout_sec=15)
+            if qr.returncode == 0:
+                print(f"  ✅ Found torch at: {quick_path} (quick path)", flush=True)
+                self._remote_python = quick_path
+                return self._remote_python
+
         # ── Probe 1: system python3 ──
         r = self._ssh(ip, "python3 -c 'import torch; print(1)'",
                        capture=True, check=False, timeout_sec=15)
@@ -328,7 +343,7 @@ class RemoteHostRunner:
 
         # If we fell back to system python3 without torch, install ROCm-compatible
         # PyTorch from the AMD/PyTorch index into the overlay.
-        # NOTE: PyTorch's wheel index uses major.minor version (rocm7.2),
+        # NOTE: PyTorch's wheel index uses major.minor version (e.g. rocm7.2),
         # NOT major.minor.patch (rocm7.2.4).
         if python_cmd == "python3":
             check = self._ssh(ip,
@@ -337,20 +352,60 @@ class RemoteHostRunner:
                 capture=True, check=False, timeout_sec=15)
             if check.returncode != 0:
                 print("  📦 Installing ROCm PyTorch to package overlay...", flush=True)
-                install_torch = (
-                    f"mkdir -p {overlay} && "
-                    f"export PYTHONPATH={qdir}:{overlay} && "
-                    f"pip install torch torchvision torchaudio "
-                    f"--target {overlay} "
-                    f"--index-url https://download.pytorch.org/whl/rocm7.2 "
-                    f"--break-system-packages 2>&1"
-                )
-                self._ssh(ip, install_torch, capture=True, check=True, timeout_sec=1200)
-                py_ver = self._ssh(ip,
-                    f"export PYTHONPATH={qdir}:{overlay} && "
-                    f"python3 -c 'import torch; print(torch.__version__)'",
-                    capture=True, check=True, timeout_sec=15)
-                print(f"  ✅ ROCm PyTorch {py_ver.stdout.strip()} installed in overlay", flush=True)
+                # Pre-flight: verify the ROCm wheel index is reachable and
+                # has a wheel for the current Python version before attempting
+                # a large install that will just fail.
+                py_ver_check = self._ssh(ip,
+                    "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")'",
+                    capture=True, check=False, timeout_sec=15)
+                rocm_variants = ("rocm7.2", "rocm6.2")
+                install_ok = False
+                last_error = ""
+                for rocm_variant in rocm_variants:
+                    index_url = f"https://download.pytorch.org/whl/{rocm_variant}"
+                    # Quick check: can we reach the index at all?
+                    probe = self._ssh(ip,
+                        f"python3 -c 'import urllib.request; "
+                        f"r = urllib.request.urlopen(\"{index_url}/torch/\", timeout=15); "
+                        f"print(r.status)' 2>&1",
+                        capture=True, check=False, timeout_sec=20)
+                    if probe.returncode != 0 or "200" not in (probe.stdout or ""):
+                        last_error = f"index {index_url} not reachable (status: {probe.stdout.strip() if probe.stdout else 'timeout'})"
+                        print(f"  ⚠️  {last_error}; trying next variant...", flush=True)
+                        continue
+                    try:
+                        install_torch = (
+                            f"mkdir -p {overlay} && "
+                            f"export PYTHONPATH={qdir}:{overlay} && "
+                            f"pip install torch torchvision torchaudio "
+                            f"--target {overlay} "
+                            f"--index-url {index_url} "
+                            f"--break-system-packages 2>&1"
+                        )
+                        self._ssh(ip, install_torch, capture=True, check=True, timeout_sec=1200)
+                        # Verify the install actually works
+                        py_ver = self._ssh(ip,
+                            f"export PYTHONPATH={qdir}:{overlay} && "
+                            f"python3 -c 'import torch; print(torch.__version__)'",
+                            capture=True, check=True, timeout_sec=15)
+                        print(f"  ✅ ROCm PyTorch {py_ver.stdout.strip()} installed in overlay "
+                              f"(via {rocm_variant})", flush=True)
+                        install_ok = True
+                        break
+                    except RuntimeError as exc:
+                        last_error = str(exc)
+                        print(f"  ⚠️  Install failed via {rocm_variant}: {last_error}", flush=True)
+                        continue
+
+                if not install_ok:
+                    raise RuntimeError(
+                        f"Could not install ROCm PyTorch on the AMD VM. "
+                        f"Checked indices: {', '.join(rocm_variants)}. "
+                        f"Last error: {last_error}. "
+                        f"The VM's Python may not be compatible with the available ROCm wheels. "
+                        f"Try using the PyTorch Quick Start image (amddevelopercloud-pytorch2100rocm724) "
+                        f"which has torch pre-installed."
+                    )
 
         self._run_host_stage(ip, remote_job_dir, "runtime",
                              f"{python_cmd} -u runtime_bootstrap.py",
@@ -360,132 +415,195 @@ class RemoteHostRunner:
     # ── Output Download ─────────────────────────────────────────────────
 
     def download_outputs(self, ip: str, workspace: JobWorkspace, remote_job_dir: str) -> Path:
-        """Download via tar-over-SSH pipe."""
-        local_dir = LOCAL_OUTPUTS_DIR / workspace.job_id
-        # Clean stale output files from any previous run of the same job_id
-        if local_dir.exists():
-            import shutil as _shutil
-            _shutil.rmtree(local_dir)
-        local_dir.mkdir(parents=True, exist_ok=True)
+        """Download the remote ``outputs/`` directory into the run folder.
 
-        # Fresh SSH connection for download
-        download_ssh_opts = [
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=15",
-            "-o", "ControlMaster=no",
-            "-o", "ControlPath=none",  # FIX 1: Explicitly bypass stale multiplex sockets
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=20",
-            "-o", "LogLevel=quiet",
-            "-i", str(self.settings.ssh_private_key_path),
-        ]
+        The transfer is an **atomic, size-verified file copy** rather than a
+        live ``tar | ssh`` pipe:
 
-        # Probe that SSH is responsive before starting the pipe
+        1. Pack ``outputs/`` into a gzip tarball **file on the VM**
+           (``tar -czf <file>``), then read back its byte size with ``stat``.
+           Writing to a regular file — not stdout — means there is no SSH
+           stdout pipe for a lingering VM background process to hold open, so
+           the remote command always returns a clean exit code.
+        2. ``scp`` the single tarball down to a local temp file. ``scp`` is
+           atomic, integrity-checked end-to-end, and reuses the SSH retry logic
+           in ``_run`` for transient network errors.
+        3. Verify the local file size matches the remote ``stat`` size — a
+           mismatch means the transfer was truncated and we raise immediately
+           (no silent partial download).
+        4. Extract the tarball into ``workspace.outputs_dir.parent`` (the
+           per-execution run folder) so artifacts land at
+           ``<run_dir>/outputs/...`` with no post-run shift, then remove the
+           tarball and clean up the remote copy.
+
+        Remote tar stderr is redirected to a file on the VM (not piped through
+        SSH) so a verbose tar can never block the command; we read it back only
+        if the pack step fails.
+        """
+        import shutil as _shutil
+
+        outputs_dir = workspace.outputs_dir
+        # Clean stale outputs from any previous run in this run folder, then
+        # (re)create the directory so the extraction target exists.
+        if outputs_dir.exists():
+            _shutil.rmtree(outputs_dir)
+        outputs_dir.parent.mkdir(parents=True, exist_ok=True)
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        extract_dir = outputs_dir.parent
+
+        def _format_size(byte_count: int) -> str:
+            """Human-readable size — KB for < 1 MB, MB otherwise."""
+            if byte_count < 1024 * 1024:
+                return f"{byte_count / 1024:.1f} KB"
+            return f"{byte_count / (1024 * 1024):.1f} MB"
+
+        remote_tarball = f"{remote_job_dir}/outputs.tar.gz"
+        remote_err_file = "/tmp/dc_tar_pack.err"
+        download_start = time.monotonic()
+
+        # ── 1. Pack outputs/ into a tarball file on the VM + read its size ──
+        print("  ⬇  Packing outputs on the VM…", flush=True)
+        pack_cmd = (
+            f"cd {shlex.quote(remote_job_dir)} && "
+            f"rm -f {shlex.quote(remote_tarball)} && "
+            f"timeout 1800 tar -czf {shlex.quote(remote_tarball)} "
+            f"--exclude-caches-all outputs 2>{shlex.quote(remote_err_file)} && "
+            f"stat -c %s {shlex.quote(remote_tarball)}"
+        )
+        pack_result = self._ssh(
+            ip, pack_cmd, capture=True, check=False,
+            timeout_sec=1800, print_output=False,
+        )
+        if pack_result.returncode != 0:
+            tar_stderr = ""
+            try:
+                err_result = self._ssh(
+                    ip,
+                    f"cat {shlex.quote(remote_err_file)} 2>/dev/null || true",
+                    capture=True, check=False, timeout_sec=30, print_output=False,
+                )
+                tar_stderr = (err_result.stdout or "").strip()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Remote tar of outputs failed (exit {pack_result.returncode}): "
+                f"{tar_stderr or pack_result.stderr or 'No stderr was returned.'}"
+            )
+        size_lines = (pack_result.stdout or "").strip().splitlines()
+        if not size_lines:
+            raise RuntimeError(
+                "Remote tar succeeded but did not report a tarball size "
+                "(empty `stat` output). Cannot verify the download."
+            )
+        try:
+            remote_size = int(size_lines[-1].strip())
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Could not parse remote tarball size from `stat` output "
+                f"{size_lines[-1]!r}: {exc}"
+            )
+
+        # ── 2. scp the tarball down to a local temp file ──
+        local_tarball = extract_dir / "outputs.tar.gz.part"
+        print(
+            f"  ⬇  Downloading outputs… {_format_size(remote_size)}",
+            flush=True,
+        )
         self._run(
-            ["ssh", *download_ssh_opts, f"{self.settings.admin_user}@{ip}", "echo 'ok'"],
-            capture=True, print_output=False, timeout_sec=30,
-        )
-
-        # Wrap the remote tar in `timeout` so a stuck remote process (e.g. a
-        # leftover background job still holding the SSH session's stdout
-        # open, or a socket/FIFO/device file blocking a read) can't hang the
-        # channel forever.
-        tar = subprocess.Popen(
             [
-                "ssh", *download_ssh_opts, f"{self.settings.admin_user}@{ip}",
-                f"cd {shlex.quote(remote_job_dir)} && "
-                f"timeout 1800 tar -czf - --exclude-caches-all outputs 2>/tmp/dc_tar_remote.err; "
-                f"rc=$?; cat /tmp/dc_tar_remote.err >&2; exit $rc",
+                "scp", *self.ssh_options,
+                f"{self.settings.admin_user}@{ip}:{remote_tarball}",
+                str(local_tarball),
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture=True, print_output=False, timeout_sec=1800,
         )
-        try:
-            result = subprocess.run(
-                ["tar", "-xzf", "-", "-C", str(local_dir)],
-                stdin=tar.stdout,
-                capture_output=True,
-                timeout=3600,
-            )
-        finally:
-            if tar.stdout:
-                tar.stdout.close()
 
-        # FIX: bound the wait so a stuck remote session can't hang forever;
-        # kill it and surface a clear error instead of blocking silently.
+        # ── 3. Verify the local size matches the remote size ──
+        if not local_tarball.exists():
+            raise RuntimeError(
+                f"scp reported success but the tarball is missing at "
+                f"{local_tarball}."
+            )
+        local_size = local_tarball.stat().st_size
+        if local_size != remote_size:
+            raise RuntimeError(
+                f"Downloaded tarball is incomplete: local size {local_size} "
+                f"bytes != remote size {remote_size} bytes. The transfer was "
+                f"truncated — not extracting a partial archive."
+            )
+
+        # ── 4. Extract locally, then remove the tarball ──
+        extract = subprocess.run(
+            ["tar", "-xzf", str(local_tarball), "-C", str(extract_dir)],
+            capture_output=True, text=True, timeout=600,
+        )
+        if extract.returncode != 0:
+            raise RuntimeError(
+                f"Local extraction of the downloaded tarball failed "
+                f"(exit {extract.returncode}): {extract.stderr.strip()}"
+            )
         try:
-            tar_stderr_bytes = tar.stderr.read() if tar.stderr else b""
+            local_tarball.unlink()
+        except OSError:
+            pass
+
+        # Best-effort cleanup of the remote tarball + stderr file.
+        try:
+            self._ssh(
+                ip,
+                f"rm -f {shlex.quote(remote_tarball)} {shlex.quote(remote_err_file)}",
+                capture=True, check=False, timeout_sec=30, print_output=False,
+            )
         except Exception:
-            tar_stderr_bytes = b""
-        try:
-            tar.wait(timeout=60)
-        except subprocess.TimeoutExpired:
-            tar.kill()
-            tar.wait(timeout=10)
-            raise RuntimeError(
-                "Download stalled: the remote SSH session for `tar -czf` did not "
-                "close even after the transfer appeared to finish. This usually "
-                "means a leftover background process on the VM is still holding "
-                "the session's stdout/stderr open, or a non-regular file "
-                "(socket/FIFO/device) inside the outputs directory blocked the "
-                "remote tar read. The local extraction already completed, so "
-                "your files in "
-                f"{local_dir} should be intact — but you should check for "
-                "orphaned processes on the remote host."
-            )
-        finally:
-            if tar.stderr:
-                tar.stderr.close()
+            pass
 
-        tar_stderr = tar_stderr_bytes.decode(errors="replace") if isinstance(tar_stderr_bytes, bytes) else str(tar_stderr_bytes or "")
-
-        if result.returncode != 0 or tar.returncode != 0:
-            detail = (result.stderr.decode(errors="replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")).strip()
-            if tar_stderr.strip():
-                detail = (detail + "; " + tar_stderr.strip()).strip()
-            raise RuntimeError(
-                f"Download via SSH pipe failed: "
-                f"ssh exit {tar.returncode}, tar exit {result.returncode}: "
-                f"{detail or 'No stderr was returned.'}"
-            )
-
-        print(f"Outputs downloaded to {local_dir}")
-        for output in sorted(os.listdir(local_dir)):
+        elapsed = time.monotonic() - download_start
+        print(
+            f"  ✅ Download complete: {_format_size(remote_size)} "
+            f"in {elapsed:.0f}s",
+            flush=True,
+        )
+        print(f"Outputs downloaded to {outputs_dir}")
+        for output in sorted(os.listdir(outputs_dir)):
             print(f"  {output}")
-        return local_dir
+        return outputs_dir
 
     def _silence_shell_banner(self, ip: str) -> None:
         """Suppress vendor banners for non-interactive SSH connections.
 
-        AMD DevCloud images print "Please wait while we get your droplet ready..."
-        from a profile.d script or update-motd.  This function:
+        AMD DevCloud images may print "Please wait while we get your droplet
+        ready..." from profile.d scripts on every SSH command.  This function
+        uses only **non-destructive** techniques that never touch /etc/ files:
 
-        1. Neutralizes banner ``echo``/``printf`` lines by prepending ``: #``
-           (a no-op followed by a comment character).
-        2. Disables all executable scripts in /etc/update-motd.d/.
-        3. Creates ``~/.hushlogin`` for sshd MOTD suppression.
+        1. Creates ``~/.hushlogin`` — tells sshd to skip the MOTD banner.
+        2. Backs up any existing ``~/.bashrc`` to ``~/.bashrc.dc_backup`` (once,
+           idempotently) and writes a new ``~/.bashrc`` that exits early for
+           non-interactive shells (preventing profile.d banner scripts from
+           running during our command-only SSH sessions) while still sourcing
+           the user's *original* bashrc for interactive logins.
+
+        No system files are modified; no chmod is applied; the user's original
+        bashrc is preserved (not clobbered).
         """
+        safe_bashrc = (
+            r'# Dynamic Cloud — suppress banner for non-interactive SSH commands.'
+            r'\n# Non-interactive shells return early so profile.d banner scripts'
+            r'\n# never run during our command-only SSH sessions.'
+            r'\nif [[ $- != *i* ]]; then return; fi'
+            r'\n# Interactive shell: restore the original bashrc (backed'
+            r'\n# up once to ~/.bashrc.dc_backup before we overwrote it).'
+            r'\nif [ -f ~/.bashrc.dc_backup ]; then . ~/.bashrc.dc_backup; fi'
+        )
         cmd = (
             'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; '
-            'touch ~/.hushlogin 2>/dev/null; '
-            # Find files containing "Please wait" and neutralize matching lines
-            'for f in $(grep -rl "Please wait" /etc/profile.d/ 2>/dev/null || true); do '
-            "  sed -i 's/.*Please wait.*/: # &/' \"$f\" 2>/dev/null || true; "
-            'done; '
-            'for f in /etc/bash.bashrc /etc/profile ~/.bashrc ~/.profile; do '
-            '  if [ -f "$f" ]; then '
-            "    sed -i 's/.*Please wait.*/: # &/' \"$f\" 2>/dev/null || true; "
-            '  fi; '
-            'done; '
-            # Disable MOTD dynamic scripts
-            'chmod -x /etc/update-motd.d/* 2>/dev/null || true; '
-            # Logout-of-band check: actually find and null out the echo
-            "grep -rl 'Please wait' /etc/ 2>/dev/null | "
-            "while read -r f; do "
-            "  sed -i 's/.*Please wait.*/: # &/' \"$f\" 2>/dev/null || true; "
-            "done; "
-            ':'
+            # Back up the user's original ~/.bashrc exactly once, BEFORE we
+            # overwrite it, so interactive shells can still source it.
+            'if [ -f ~/.bashrc ] && [ ! -f ~/.bashrc.dc_backup ]; then '
+            "cp ~/.bashrc ~/.bashrc.dc_backup; "
+            'fi; '
+            r"touch ~/.hushlogin 2>/dev/null; "
+            r"printf '%b\n' " + shlex.quote(safe_bashrc) + r" > ~/.bashrc; "
+            r':'
         )
         self._ssh(ip, cmd, print_output=False, check=False, timeout_sec=30)
 
@@ -553,17 +671,19 @@ class RemoteHostRunner:
     def _wait_for_ssh_ready(self, ip: str) -> None:
         """Wait for basic SSH key login to succeed.
 
-        Mirrors ``ano_temp/run.py:wait_for_ssh`` — probes with ``echo 'Ready'``
-        every 10 seconds, up to 20 attempts (200s max).
+        Polls with ``echo 'Ready'`` every 10 seconds until the timeout is hit.
+        Configurable via ``AMD_SSH_WAIT_TIMEOUT_SEC`` (default 600s).
 
         Raises ``TimeoutError`` if SSH never becomes available.
         """
-        print("🔒 Probing VM for SSH handshake availability...")
+        timeout_sec = max(self.settings.wait_ssh_timeout_sec, 60)
+        max_attempts = timeout_sec // 10
+        print(f"🔒 Probing VM for SSH handshake availability (timeout {timeout_sec}s)...")
         cmd = [
             "ssh", *self._ssh_probe_options(), f"{self.settings.admin_user}@{ip}",
             "echo 'Ready'",
         ]
-        for _ in range(20):
+        for _ in range(max_attempts):
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             except subprocess.TimeoutExpired:
@@ -575,25 +695,27 @@ class RemoteHostRunner:
             time.sleep(10)
         raise TimeoutError(
             f"SSH login for {self.settings.admin_user}@{ip} did not become ready "
-            f"within 200 seconds. Verify AMD_SSH_PRIVATE_KEY_PATH matches the "
+            f"within {timeout_sec} seconds. Verify AMD_SSH_PRIVATE_KEY_PATH matches the "
             f"key attached to the Droplet."
         )
 
     def _wait_for_provisioning(self, ip: str) -> None:
         """Wait out AMD vendor initialization banner and reboots.
 
-        Mirrors ``ano_temp/run.py:wait_for_custom_provisioning`` — polls with
-        ``echo 'SSHD_READY'`` every 10 seconds, up to 42 attempts (420s max).
+        Polls with ``echo 'SSHD_READY'`` every 10 seconds until the timeout.
+        Configurable via ``AMD_PROVISIONING_WAIT_TIMEOUT_SEC`` (default 600s).
         We know provisioning is done when:
         - stdout contains "SSHD_READY" (SSH is responsive)
         - output does NOT contain "Please wait" (vendor banner is gone)
         """
-        print("🛠️ Waiting for AMD system initialization and potential reboots to finish...")
+        timeout_sec = max(self.settings.wait_provisioning_timeout_sec, 60)
+        max_attempts = timeout_sec // 10
+        print(f"🛠️ Waiting for AMD system initialization (timeout {timeout_sec}s)...")
         cmd = [
             "ssh", *self._ssh_probe_options(), f"{self.settings.admin_user}@{ip}",
             "echo 'SSHD_READY'",
         ]
-        for _ in range(42):
+        for _ in range(max_attempts):
             try:
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
             except subprocess.TimeoutExpired:
@@ -617,8 +739,9 @@ class RemoteHostRunner:
 
         raise TimeoutError(
             f"AMD environment initialization at {ip} did not complete within "
-            f"420 seconds. The vendor banner may still be active or SSH "
-            f"may have failed to stabilize."
+            f"{timeout_sec} seconds. The vendor banner may still be active or SSH "
+            f"may have failed to stabilize. Increase AMD_PROVISIONING_WAIT_TIMEOUT_SEC "
+            f"if the image needs more time."
         )
 
     @staticmethod

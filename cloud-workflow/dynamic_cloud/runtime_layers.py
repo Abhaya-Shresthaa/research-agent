@@ -243,7 +243,8 @@ def build_runtime_metadata(
     return {
         "framework": framework,
         "accelerator": accelerator,
-        "image": image,
+        "image": image,  # reference slug only — the runner executes natively, not via Docker
+        "execution_mode": "native_host",  # workloads run on host Python, no container pulled
         "entrypoint": "generated/script.py",
         "outputs_dir": "/outputs",
         "extra_packages": extra_packages,
@@ -734,7 +735,6 @@ def _retry_hf_dataset_with_compat_libs(
     import json
     import subprocess
     import sys
-    import tempfile
     from pathlib import Path
 
     print(
@@ -745,22 +745,27 @@ def _retry_hf_dataset_with_compat_libs(
     target_str = str(target)
     kwargs_json = json.dumps(kwargs)
 
-    # Install old-compatible versions into a temporary directory that will be
-    # inserted first on sys.path, so they shadow the overlay's new versions.
-    # Using a separate dir + --ignore-installed avoids the problem where pip's
-    # --target adds to an overlay already containing datasets==5.0.0 without
-    # actually replacing those package directories.
-    old_libs_dir = tempfile.mkdtemp(prefix="hf-retry-")
-    subprocess.check_call(
-        [
-            sys.executable, "-m", "pip", "install",
-            "--target", old_libs_dir,
-            "--ignore-installed",
-            "--quiet",
-            "huggingface_hub<0.24.0", "datasets<3.0.0",
-        ],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    # Cache compat libs in a stable directory under the dataset cache root
+    # so they are reused across retries — no repeated pip installs.
+    old_libs_dir = str(DATASETS_ROOT / ".hf_compat_overlay")
+    hf_hub_dir = os.path.join(old_libs_dir, "huggingface_hub")
+    datasets_dir = os.path.join(old_libs_dir, "datasets")
+
+    if not (os.path.isdir(hf_hub_dir) and os.path.isdir(datasets_dir)):
+        print(f"[dataset] Installing compat libs to {old_libs_dir}...", flush=True)
+        os.makedirs(old_libs_dir, exist_ok=True)
+        subprocess.check_call(
+            [
+                sys.executable, "-m", "pip", "install",
+                "--target", old_libs_dir,
+                "--ignore-installed",
+                "--quiet",
+                "huggingface_hub<0.24.0", "datasets<3.0.0",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    else:
+        print(f"[dataset] Reusing cached compat libs at {old_libs_dir}", flush=True)
 
     lines = [
         "import sys",
@@ -802,13 +807,74 @@ def _prepare_github(config: dict[str, Any]) -> Path:
     target = _dataset_target(config, url)
     if target.exists() and any(target.iterdir()):
         return _write_info(config, target)
-    branch = config.get("branch")
-    command = ["git", "clone", "--depth", "1"]
-    if branch:
-        command.extend(["--branch", str(branch)])
-    command.extend([url, str(target)])
-    subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return _write_info(config, target)
+    # Requested branch may be None — in that case use the repo's *default*
+    # branch (do NOT force "main"; many repos default to "master" or another
+    # name and `git clone --branch main` would fail).
+    requested_branch = config.get("branch")
+
+    # Probe for git; install if missing; fall back to tarball download.
+    has_git = False
+    try:
+        subprocess.check_call(["which", "git"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        has_git = True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    if not has_git:
+        print("[dataset] git not found on VM; attempting to install...", flush=True)
+        try:
+            subprocess.check_call(
+                ["apt-get", "update", "-qq"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+            )
+            subprocess.check_call(
+                ["apt-get", "install", "-y", "-qq", "git"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+            )
+            has_git = True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+
+    if has_git:
+        command = ["git", "clone", "--depth", "1"]
+        if requested_branch:
+            command.extend(["--branch", str(requested_branch)])
+        command.extend([url, str(target)])
+        subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return _write_info(config, target)
+
+    # Fallback: download as tarball via curl.  The GitHub archive URL needs an
+    # explicit branch, so when the user did not name one we try the common
+    # defaults (main, then master) until one resolves.
+    print(f"[dataset] Installing git failed; downloading {url} as tarball...", flush=True)
+    candidate_branches = [str(requested_branch)] if requested_branch else ["main", "master"]
+    target.mkdir(parents=True, exist_ok=True)
+    tarball_path = target / "source.tar.gz"
+    last_exc: Exception | None = None
+    for branch in candidate_branches:
+        tarball_url = f"{url.rstrip('/')}/archive/refs/heads/{branch}.tar.gz"
+        try:
+            subprocess.check_call(
+                ["curl", "-fsSL", "-o", str(tarball_path), tarball_url],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300,
+            )
+            subprocess.check_call(
+                ["tar", "-xzf", str(tarball_path), "-C", str(target), "--strip-components=1"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+            )
+            tarball_path.unlink(missing_ok=True)
+            return _write_info(config, target)
+        except subprocess.CalledProcessError as exc:
+            last_exc = exc
+            tarball_path.unlink(missing_ok=True)
+            print(f"[dataset] tarball for branch '{branch}' failed; trying next...", flush=True)
+            continue
+    raise RuntimeError(
+        f"Could not clone or download GitHub dataset from {url}. "
+        f"Both git clone and tarball download failed (tried branches: "
+        f"{', '.join(candidate_branches)}). "
+        f"Verify the URL and network access on the VM."
+    ) from last_exc
 
 
 def _write_info(config: dict[str, Any], dataset_path: Path) -> Path:

@@ -59,3 +59,8 @@ user_resources/user_script/
 *.log
 *.tmp
 *.pid
+
+
+compare.md
+problems.md
+solved.md

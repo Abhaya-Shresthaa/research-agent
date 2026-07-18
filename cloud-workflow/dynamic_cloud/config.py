@@ -13,8 +13,6 @@ except ModuleNotFoundError:
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 PROJECT_ROOT_DIR = ROOT_DIR
-RUNTIME_WORKSPACE = ROOT_DIR / "runtime_workspace"
-LOCAL_OUTPUTS_DIR = ROOT_DIR / "outputs"
 
 
 def _expand_path(value: str) -> Path:
@@ -92,6 +90,7 @@ class AmdSettings:
     wait_droplet_timeout_sec: int = 600
     wait_ssh_timeout_sec: int = 300
     wait_initialization_timeout_sec: int = 1200
+    wait_provisioning_timeout_sec: int = 600  # _wait_for_provisioning in docker_runner
     regions: tuple[str, ...] = (
         "atl1",
     )
@@ -118,7 +117,7 @@ class LlmSettings:
     base_url: str | None = "https://api.fireworks.ai/inference/v1"
 
 
-def load_amd_settings(vm_name: str | None = None) -> AmdSettings:
+def load_amd_settings(vm_name: str | None = None, *, skip_ssh_validation: bool = False) -> AmdSettings:
     load_environment()
     api_key = _first_env_value("AMD_TOKEN", "AMD_API_KEY", "DIGITALOCEAN_ACCESS_TOKEN", "DO_API_TOKEN")
     if not api_key:
@@ -140,7 +139,8 @@ def load_amd_settings(vm_name: str | None = None) -> AmdSettings:
         vm_sizes = (default_size,)
 
     ssh_private_key_path = _expand_path(os.getenv("AMD_SSH_PRIVATE_KEY_PATH", "~/.ssh/id_rsa"))
-    _validate_ssh_private_key(ssh_private_key_path)
+    if not skip_ssh_validation:
+        _validate_ssh_private_key(ssh_private_key_path)
 
     region = os.getenv("AMD_REGION", "atl1").strip() or "atl1"
     raw_regions = os.getenv("AMD_REGIONS")
@@ -181,8 +181,9 @@ def load_amd_settings(vm_name: str | None = None) -> AmdSettings:
         ssh_public_key_path=_expand_path(os.getenv("AMD_SSH_PUBLIC_KEY_PATH", "~/.ssh/id_rsa.pub")),
         ssh_private_key_path=ssh_private_key_path,
         wait_droplet_timeout_sec=int(os.getenv("AMD_DROPLET_WAIT_TIMEOUT_SEC", "600")),
-        wait_ssh_timeout_sec=int(os.getenv("AMD_SSH_WAIT_TIMEOUT_SEC", "300")),
+        wait_ssh_timeout_sec=int(os.getenv("AMD_SSH_WAIT_TIMEOUT_SEC", "600")),
         wait_initialization_timeout_sec=int(os.getenv("AMD_INITIALIZATION_WAIT_TIMEOUT_SEC", "1200")),
+        wait_provisioning_timeout_sec=int(os.getenv("AMD_PROVISIONING_WAIT_TIMEOUT_SEC", "600")),
         regions=regions,
         vm_sizes=vm_sizes,
     )

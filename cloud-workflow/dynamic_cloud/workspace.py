@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import re
 import shutil
@@ -7,8 +8,60 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from dynamic_cloud.config import RUNTIME_WORKSPACE
 from dynamic_cloud.dataset_config import normalize_dataset_config
+
+
+def _timestamp() -> str:
+    """Stable YYYYMMDD-HHMMSS stamp for archive sibling names."""
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _run_stamp() -> str:
+    """Compact ``MM-DD-HHMM`` stamp used in per-execution run folder names."""
+    return datetime.datetime.now().strftime("%m-%d-%H%M")
+
+
+def archive_existing_dir(path: Path) -> Path | None:
+    """Rename an existing directory to a timestamped archive sibling so its
+    contents survive a re-run with the same job_id. Returns the archive path,
+    or ``None`` if ``path`` did not exist. **Never destroys data** — the only
+    operation is a same-filesystem rename into ``<name>.<ts>.archive``.
+
+    Used instead of ``shutil.rmtree`` so that re-running a job with the same
+    title preserves the prior completed run's outputs / prepared workspace
+    (Section E, E1) instead of silently deleting them.
+    """
+    if not path.exists():
+        return None
+    base = f"{path.name}.{_timestamp()}.archive"
+    archive = path.parent / base
+    # If two archives land in the same second, disambiguate with a counter.
+    i = 0
+    while archive.exists():
+        i += 1
+        archive = path.parent / f"{base}{i}"
+    # Same-filesystem rename (path and its archive are siblings).
+    shutil.move(str(path), str(archive))
+    return archive
+
+
+def _short_slug(label: str) -> str:
+    """Filesystem-safe slug for a run folder name.
+
+    The cloud workflow passes the LLM-generated ``job_title`` (already short);
+    research-only runs pass the raw query, which is collapsed to the first two
+    tokens (and then length-capped) when it is too long so the folder name
+    stays compact. Blank or symbol-only input falls back to ``run``.
+    """
+    slug = safe_job_id((label or "").strip()).strip(".-")
+    # safe_job_id falls back to "dynamic-job" for empty/symbol-only input.
+    if not slug or slug == "dynamic-job":
+        return "run"
+    if len(slug) > 30:
+        slug = "-".join(slug.split("-")[:2]).strip(".-")
+    if len(slug) > 30:
+        slug = slug[:30].strip(".-")
+    return slug or "run"
 
 
 @dataclass(frozen=True)
@@ -18,6 +71,7 @@ class JobWorkspace:
     payload_dir: Path
     generated_dir: Path
     data_dir: Path
+    outputs_dir: Path
 
 
 def load_job_spec(path: Path) -> dict[str, Any]:
@@ -35,16 +89,55 @@ def safe_job_id(raw: str) -> str:
     return value or "dynamic-job"
 
 
-def prepare_workspace(spec: dict[str, Any], reset: bool = False) -> JobWorkspace:
+def create_run_dir(outputs_root: Path, label: str) -> Path:
+    """Create and return a per-execution folder under ``outputs_root``.
+
+    The folder name is ``<slug>-<MM-DD-HHMM>`` where ``slug`` is a short,
+    filesystem-safe rendering of ``label`` — the LLM-generated ``job_title``
+    for cloud runs (see ``_short_slug``), or a condensed form of the query for
+    research-only runs. The minute-precision stamp makes the name unique per
+    minute; if a same-minute collision happens, a ``-2``, ``-3`` … suffix is
+    appended.
+
+    Everything one execution produces — the research ``report.md``, the cloud
+    experiment ``outputs/``, the generated payload under ``runtime_generated/``,
+    and the unified ``final-report.md`` — lands inside this single folder.
+    """
+    slug = _short_slug((label or "").strip())
+    ts = _run_stamp()
+    name = f"{slug}-{ts}"
+    run_dir = outputs_root / name
+    suffix = 2
+    while run_dir.exists():
+        run_dir = outputs_root / f"{name}-{suffix}"
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def prepare_workspace(spec: dict[str, Any], *, run_dir: Path, reset: bool = False) -> JobWorkspace:
+    """Prepare the generated payload workspace directly under ``run_dir``.
+
+    The workspace root is ``run_dir / "runtime_generated"`` (holding ``payload/``
+    and ``job_spec.json``), and the cloud experiment outputs directory is
+    ``run_dir / "outputs"`` — so generation and downloads land in the final
+    per-execution folder with no post-run shifting.
+    """
     job_id = safe_job_id(str(spec["job_id"]))
     spec["dataset"] = normalize_dataset_config(spec.get("dataset") or {})
-    root = RUNTIME_WORKSPACE / job_id
+    root = run_dir / "runtime_generated"
     payload_dir = root / "payload"
     generated_dir = payload_dir / "generated"
     data_dir = payload_dir / "data"
+    outputs_dir = run_dir / "outputs"
 
     if reset and root.exists():
-        shutil.rmtree(root)
+        # E1: a re-run with the same job_id must not silently wipe a prior
+        # prepared workspace. Archive it to a timestamped sibling instead of
+        # rmtree'ing it, so the prior generated payload/spec survives.
+        archived = archive_existing_dir(root)
+        if archived:
+            print(f"  Prior workspace archived to {archived.name} (preserved).")
 
     generated_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -52,7 +145,14 @@ def prepare_workspace(spec: dict[str, Any], reset: bool = False) -> JobWorkspace
     (root / "job_spec.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
 
     prepare_dataset(spec.get("dataset") or {}, data_dir)
-    return JobWorkspace(job_id=job_id, root=root, payload_dir=payload_dir, generated_dir=generated_dir, data_dir=data_dir)
+    return JobWorkspace(
+        job_id=job_id,
+        root=root,
+        payload_dir=payload_dir,
+        generated_dir=generated_dir,
+        data_dir=data_dir,
+        outputs_dir=outputs_dir,
+    )
 
 
 def prepare_dataset(dataset: dict[str, Any], data_dir: Path) -> None:

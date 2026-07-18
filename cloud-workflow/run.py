@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import shutil
@@ -37,7 +38,7 @@ from dynamic_cloud.vm_options import (
     validate_vm_accelerator,
     vm_option_for_size,
 )
-from dynamic_cloud.workspace import JobWorkspace, normalize_dataset_config, prepare_workspace, safe_job_id, validate_payload
+from dynamic_cloud.workspace import JobWorkspace, create_run_dir, normalize_dataset_config, prepare_workspace, safe_job_id, validate_payload
 
 # Permanent local dataset staging directory at the base of final_amd/.
 # When the user selects "Local file or folder path" as the dataset source, their
@@ -45,6 +46,11 @@ from dynamic_cloud.workspace import JobWorkspace, normalize_dataset_config, prep
 _PARENT_BASE = Path(__file__).resolve().parents[1]  # final_amd/
 LOCAL_UPLOAD_DIR = _PARENT_BASE / "user_resources" / "uploading_data"
 USER_SCRIPT_DIR = _PARENT_BASE / "user_resources" / "user_script"
+# E2: prior staging content is moved here (timestamped subdirs) instead of
+# being deleted when uploading_data/ is re-populated, so a partway copy
+# failure can never lose the previously-staged dataset. Lives OUTSIDE
+# uploading_data/ so the contents listing used for local_paths excludes it.
+_UPLOADING_ARCHIVE_DIR = _PARENT_BASE / "user_resources" / ".uploading_archive"
 
 
 def _check_user_script() -> tuple[bool, str]:
@@ -147,13 +153,21 @@ def _setup_and_inspect_local_dataset(selected_dataset: dict[str, Any]) -> dict[s
         )
 
         if not is_self_ref:
-            # User provided new paths — clear uploading_data/ and re-populate
+            # User provided new paths — archive the existing staging content
+            # (E2) and re-populate uploading_data/ with the new paths.
             print(f"\nCopying local data to permanent staging directory:\n  {LOCAL_UPLOAD_DIR}\n")
-            for item in list(LOCAL_UPLOAD_DIR.iterdir()):
-                if item.is_dir():
-                    shutil.rmtree(item)
-                else:
-                    item.unlink()
+            existing = [p for p in LOCAL_UPLOAD_DIR.iterdir()]
+            if existing:
+                # Preserve the previously-staged dataset instead of deleting it.
+                # Moved OUTSIDE uploading_data/ so it is excluded from the
+                # contents listing below (and from local_paths).
+                archive_subdir = _UPLOADING_ARCHIVE_DIR / datetime.datetime.now().strftime(
+                    "%Y%m%d-%H%M%S"
+                )
+                archive_subdir.mkdir(parents=True, exist_ok=True)
+                for item in existing:
+                    shutil.move(str(item), str(archive_subdir / item.name))
+                print(f"  Archived previous staging content to {archive_subdir}\n")
             for raw_path in local_paths:
                 source = Path(raw_path).expanduser().resolve()
                 if not source.exists():
@@ -332,7 +346,7 @@ IMPORTANT AMD ROCm CONTEXT:
 
 Return strict JSON only:
 {
-  "job_title": "short safe title",
+  "job_title": "concise title of about 2 words that defines the work (more only if needed to be clear), filesystem-safe, no quotes",
   "questions": [
     {
       "key": "snake_case_key",
@@ -542,6 +556,14 @@ def main() -> None:
     _apply_existing_droplet_selection(selected_vm, args.amd_droplet_id, args.amd_droplet_ip)
     validate_vm_accelerator(selected_vm, selected_accelerator)
     job_id = safe_job_id(str(questions_payload.get("job_title") or "dynamic-job"))
+    # Per-execution run folder: outputs/<short-job_title-slug>-<MM-DD-HHMM>/.
+    # The LLM job_title is the slug; everything (generated payload, cloud
+    # outputs, final report) lands inside this folder — no post-run shifting.
+    run_dir = create_run_dir(
+        _PARENT_BASE / "outputs",
+        str(questions_payload.get("job_title") or user_requirement),
+    )
+    print(f"\nRun folder: {run_dir.relative_to(_PARENT_BASE)}")
     dataset_metadata: dict[str, Any] | None = None
     inspection_session: AmdDropletSession | None = None
     if selected_dataset.get("type") == "local":
@@ -555,6 +577,7 @@ def main() -> None:
             selected_accelerator,
             selected_dataset,
             selected_vm,
+            run_dir=run_dir,
         )
 
     generation_payload = _generate_runtime_payload(
@@ -585,7 +608,7 @@ def main() -> None:
     runtime["image"] = select_image(selected_framework, selected_accelerator)
     validate_local_image_support(selected_framework, selected_accelerator)
 
-    workspace = prepare_workspace(job_spec, reset=dataset_metadata is None)
+    workspace = prepare_workspace(job_spec, run_dir=run_dir, reset=dataset_metadata is None)
     if not dataset_metadata and workspace.payload_dir.joinpath("dataset_metadata.json").exists():
         try:
             dataset_metadata = json.loads(workspace.payload_dir.joinpath("dataset_metadata.json").read_text(encoding="utf-8"))
@@ -873,6 +896,8 @@ def _inspect_dataset_on_amd(
     selected_accelerator: str,
     selected_dataset: dict[str, Any],
     selected_vm: dict[str, str],
+    *,
+    run_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, str], AmdDropletSession]:
     from dynamic_cloud.amd_droplet import AmdDropletManager
     from dynamic_cloud.docker_runner import RemoteHostRunner
@@ -885,7 +910,7 @@ def _inspect_dataset_on_amd(
         "dataset": normalize_dataset_config(selected_dataset),
         "amd_vm_size": selected_vm["size"],
     }
-    workspace = prepare_workspace(inspect_spec, reset=True)
+    workspace = prepare_workspace(inspect_spec, run_dir=run_dir, reset=True)
     metadata = write_dataset_inspection_payload(workspace, inspect_spec, selected_framework, selected_accelerator)
     amd_settings = _load_selected_amd_settings(workspace, selected_vm)
     droplet = AmdDropletManager(amd_settings)
@@ -1048,7 +1073,7 @@ def _print_summary(
     print(f"GPU Plan: {selected_vm['size']} - {selected_vm['label']}")
     print(f"Plan note: {selected_vm['cost_note']}")
     print(f"Payload folder: {workspace.payload_dir}")
-    print(f"Outputs folder after run: cloud-workflow/outputs/{workspace.job_id}")
+    print(f"Outputs folder after run: {workspace.outputs_dir}")
 
     outputs = summary.get("outputs") or job_spec.get("expected_outputs") or []
     if outputs:
@@ -1223,7 +1248,7 @@ def _cleanup_prepared(
     workspace, job_spec = _load_prepared_workspace(path)
     vm_size = vm_size_override or str(job_spec.get("amd_vm_size") or VM_OPTIONS[0]["size"])
     selected_vm = _vm_option_for_size(vm_size, job_spec)
-    amd_settings = _load_selected_amd_settings(workspace, selected_vm)
+    amd_settings = _load_selected_amd_settings(workspace, selected_vm, skip_ssh_validation=True)
     print(f"Destroying AMD Droplet for prepared job: {workspace.job_id}")
     manager = AmdDropletManager(amd_settings)
     resolved_droplet_id = (droplet_id or os.getenv("AMD_EXISTING_DROPLET_ID") or "").strip()
@@ -1247,12 +1272,15 @@ def _load_prepared_workspace(path: Path) -> tuple[JobWorkspace, dict[str, Any]]:
         raise FileNotFoundError(f"Prepared job spec not found: {job_spec_path}")
 
     job_spec = json.loads(job_spec_path.read_text(encoding="utf-8"))
+    # root is the runtime_generated/ folder; its parent is the per-execution
+    # run folder (outputs/<runtime_name>), so cloud outputs belong next to it.
     workspace = JobWorkspace(
         job_id=root.name,
         root=root,
         payload_dir=payload_dir,
         generated_dir=payload_dir / "generated",
         data_dir=payload_dir / "data",
+        outputs_dir=root.parent / "outputs",
     )
     return workspace, job_spec
 
@@ -1261,11 +1289,11 @@ def _vm_option_for_size(vm_size: str, job_spec: dict[str, Any] | None = None) ->
     return vm_option_for_size(vm_size, job_spec)
 
 
-def _load_selected_amd_settings(workspace: Any, selected_vm: dict[str, str]) -> Any:
+def _load_selected_amd_settings(workspace: Any, selected_vm: dict[str, str], *, skip_ssh_validation: bool = False) -> Any:
     from dataclasses import replace
 
     vm_name = selected_vm.get("vm_name") or workspace.job_id[:55]
-    amd_settings = load_amd_settings(vm_name=vm_name)
+    amd_settings = load_amd_settings(vm_name=vm_name, skip_ssh_validation=skip_ssh_validation)
     return replace(
         amd_settings,
         vm_sizes=(selected_vm["size"],),

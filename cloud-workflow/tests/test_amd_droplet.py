@@ -44,7 +44,9 @@ class AmdDropletProjectTests(unittest.TestCase):
         self.assertFalse(payload["ipv6"])
         self.assertFalse(payload["monitoring"])
         self.assertIn("#cloud-config", payload["user_data"])
-        self.assertIn("docker build --pull=false", payload["user_data"])
+        # D5: native host execution — no Docker build/pull in cloud-init.
+        self.assertIn("native host", payload["user_data"])
+        self.assertNotIn("docker build", payload["user_data"])
         self.assertNotIn("docker pull", payload["user_data"])
         self.assertEqual(payload["vpc_uuid"], "8244dc95-5e6a-45b1-a667-d8c80a851d9b")
         self.assertEqual(post.call_args.args[0], f"{manager.base_url}/droplets")
@@ -186,6 +188,44 @@ class AmdDropletProjectTests(unittest.TestCase):
             manager.wait_for_ssh("10.0.0.4")
 
         self.assertEqual(run_mock.call_count, 2)
+
+    # ── D1: destroy() must complete despite KeyboardInterrupt ─────────────
+
+    def test_destroy_retries_after_keyboard_interrupt_during_delete(self) -> None:
+        manager = AmdDropletManager(AmdSettings(api_key="token", ssh_private_key_path=Path("/tmp/key")))
+        manager.droplet_id = 4242
+
+        # First DELETE is interrupted by Ctrl-C; the retry succeeds (204).
+        with mock.patch.object(
+            manager, "_request", side_effect=[KeyboardInterrupt(), FakeResponse(204, {"id": 4242})]
+        ) as req, mock.patch("builtins.print"):
+            manager.destroy()
+
+        self.assertIsNone(manager.droplet_id)
+        self.assertEqual(req.call_count, 2)
+
+    def test_destroy_keyboard_interrupt_during_retry_sleep_does_not_abort(self) -> None:
+        manager = AmdDropletManager(AmdSettings(api_key="token", ssh_private_key_path=Path("/tmp/key")))
+        manager.droplet_id = 4242
+
+        # Attempt 1: network error → triggers a 10s sleep which is interrupted
+        # by Ctrl-C. The interrupt must be swallowed and the loop must continue.
+        # Attempt 2: success.
+        responses = [requests.exceptions.ConnectionError("boom"), FakeResponse(204, {})]
+
+        real_sleep = {"calls": 0}
+
+        def fake_sleep(_secs):
+            real_sleep["calls"] += 1
+            if real_sleep["calls"] == 1:
+                raise KeyboardInterrupt()
+
+        with mock.patch.object(manager, "_request", side_effect=responses), mock.patch(
+            "dynamic_cloud.amd_droplet.time.sleep", side_effect=fake_sleep
+        ), mock.patch("builtins.print"):
+            manager.destroy()
+
+        self.assertIsNone(manager.droplet_id)
 
 
 if __name__ == "__main__":

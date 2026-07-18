@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import json
+import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
 from dynamic_cloud.amd_droplet import AmdDropletManager
-from dynamic_cloud.config import AmdDropletSession, AmdSettings, LOCAL_OUTPUTS_DIR, ROOT_DIR, RUNTIME_WORKSPACE
+from dynamic_cloud.config import AmdDropletSession, AmdSettings
 from dynamic_cloud.docker_runner import RemoteHostRunner
 from dynamic_cloud.workspace import JobWorkspace
 
@@ -16,42 +16,6 @@ try:
     _HAS_REPORT_LLM = True
 except ImportError:
     _HAS_REPORT_LLM = False
-
-
-def _shift_completed_outputs(job_id: str) -> None:
-    """Move completed outputs and runtime workspace to project-level directories.
-
-    After a job finishes, its outputs live under ``cloud-workflow/outputs/<job_id>/``
-    and its workspace files under ``cloud-workflow/runtime_workspace/<job_id>/``.
-    This function shifts them to the project base ``final_amd/``:
-      - ``final_amd/outputs/<job_id>/``    — training artifacts
-      - ``final_amd/generated_files/<job_id>/`` — generated payload, script, metadata
-    """
-    project_base = ROOT_DIR.parent  # final_amd/
-
-    # ── Shift outputs ──────────────────────────────────────────────
-    src_outputs = LOCAL_OUTPUTS_DIR / job_id
-    dst_outputs = project_base / "outputs" / job_id
-    if src_outputs.exists():
-        dst_outputs.parent.mkdir(parents=True, exist_ok=True)
-        if dst_outputs.exists():
-            shutil.rmtree(dst_outputs)
-        shutil.move(str(src_outputs), str(dst_outputs))
-        print(f"Outputs shifted to {dst_outputs.relative_to(ROOT_DIR.parent)}")
-    else:
-        print(f"Warning: no outputs found at {src_outputs} to shift")
-
-    # ── Shift runtime workspace ────────────────────────────────────
-    src_ws = RUNTIME_WORKSPACE / job_id
-    dst_ws = project_base / "generated_files" / job_id
-    if src_ws.exists():
-        dst_ws.parent.mkdir(parents=True, exist_ok=True)
-        if dst_ws.exists():
-            shutil.rmtree(dst_ws)
-        shutil.move(str(src_ws), str(dst_ws))
-        print(f"Runtime workspace shifted to {dst_ws.relative_to(ROOT_DIR.parent)}")
-    else:
-        print(f"Warning: no runtime workspace at {src_ws} to shift")
 
 
 def _extract_sources_from_research(report_path: str) -> list[str]:
@@ -76,7 +40,7 @@ def _extract_sources_from_research(report_path: str) -> list[str]:
     return urls
 
 
-def _generate_final_report(job_id: str) -> None:
+def _generate_final_report(job_id: str, run_dir: Path) -> str:
     """Synthesize a comprehensive final-report.md from research + experiment outputs.
 
     Mirrors the ``write_final_report`` pattern from the research-workflow:
@@ -86,18 +50,29 @@ def _generate_final_report(job_id: str) -> None:
     4. Append any missing ones at the bottom with context
     5. Append sources section from research report
 
-    Called after the cloud experiment finishes and its outputs have been shifted
-    to the project-level directories.
+    All artifacts are read from / written into the per-execution folder
+    ``run_dir`` (``outputs/<runtime_name>``):
+      - research report:  ``<run_dir>/report.md``
+      - cloud outputs:    ``<run_dir>/outputs/``
+      - this report:      ``<run_dir>/final-report.md``
+
+    Returns a status string so callers can reflect the outcome in their exit
+    banner / return code:
+      - ``"ok"``      : report written
+      - ``"skipped"`` : nothing to report (no LLM, no data, or empty LLM reply)
+      - ``"failed"``  : the LLM call raised and no report was written
     """
     if not _HAS_REPORT_LLM:
         print("  [Final Report] LLM client not available (research module not loaded) — skipping.")
-        return
+        return "skipped"
 
-    project_base = ROOT_DIR.parent  # final_amd/
     sections: list[dict[str, str]] = []
 
+    research_path = run_dir / "report.md"
+    outputs_root = run_dir / "outputs"
+    final_path = run_dir / "final-report.md"
+
     # ── 1. Research report (if it exists from a parallel research run) ──
-    research_path = project_base / "outputs" / "report.md"
     has_research = research_path.exists()
     if has_research:
         report_text = research_path.read_text(encoding="utf-8")
@@ -108,7 +83,6 @@ def _generate_final_report(job_id: str) -> None:
         print("  [Final Report] Loaded research report.")
 
     # ── 2. Cloud experiment outputs ────────────────────────────────────
-    outputs_root = project_base / "outputs" / job_id / "outputs"
     if outputs_root.exists():
         # environment.json
         env_path = outputs_root / "environment.json"
@@ -171,7 +145,7 @@ def _generate_final_report(job_id: str) -> None:
 
     if not sections:
         print("  [Final Report] No data available — skipping.")
-        return
+        return "skipped"
 
     # ── 3a. Extract research report images (web URLs) ────────────────
     # Pattern from research-workflow: structured <image> XML blocks
@@ -198,19 +172,24 @@ def _generate_final_report(job_id: str) -> None:
                     break
 
     # ── 3b. Detect experiment plots (local files) ────────────────────
-    # We treat these like images but use local relative paths as the URL
+    # We treat these like images but use local relative paths as the URL.
+    # plots_root / metrics_path_ck are derived from outputs_root (the run
+    # folder's outputs/ directory).
     experiment_plots: list[dict[str, str]] = []
-    plots_root = (project_base / "outputs" / job_id / "outputs" / "plots") if job_id else None
+    plots_root = outputs_root / "plots"
     metrics_data: dict[str, Any] = {}
-    metrics_path_ck = (project_base / "outputs" / job_id / "outputs" / "metrics.json") if job_id else None
-    if metrics_path_ck and metrics_path_ck.exists():
+    metrics_path_ck = outputs_root / "metrics.json"
+    if metrics_path_ck.exists():
         try:
             metrics_data = json.loads(metrics_path_ck.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             metrics_data = {}
-    if plots_root and plots_root.exists():
+    if plots_root.exists():
+        # final-report.md lives at final_path inside the run folder, so image
+        # links must be relative to final_path.parent (the run folder).
+        report_dir = final_path.parent
         for pf in sorted(plots_root.iterdir()):
-            rel_path = str(Path(job_id) / "outputs" / "plots" / pf.name)
+            rel_path = os.path.relpath(pf, report_dir)
             # Build context from available metrics
             context_parts = []
             if "final_train_accuracy" in metrics_data:
@@ -354,7 +333,7 @@ def _generate_final_report(job_id: str) -> None:
 
         if not report_markdown.strip():
             print("  [Final Report] LLM returned empty report — skipping.")
-            return
+            return "skipped"
 
         # ── 5. Post-check: only force-append experiment plots ────────────
         # (research images are passed for inline embedding but never dumped at the bottom)
@@ -385,18 +364,20 @@ def _generate_final_report(job_id: str) -> None:
         # ── 6. Write the file ─────────────────────────────────────────
         final_markdown = report_markdown + "".join(extra_sections) + urls_section
 
-        final_path = project_base / "outputs" / "final-report.md"
+        # final_path is <run_dir>/final-report.md.
         final_path.parent.mkdir(parents=True, exist_ok=True)
         final_path.write_text(final_markdown, encoding="utf-8")
         embedded_plots = len(experiment_plots) - len(missing_plots)
-        print(f"  [Final Report] Saved to {final_path.relative_to(project_base)}")
+        print(f"  [Final Report] Saved to {final_path}")
         if research_images:
             print(f"    Research images: {len(research_images)} passed to LLM for inline embedding")
         print(f"    Experiment plots embedded inline: {embedded_plots}/{len(experiment_plots)}"
               f"{' (+ ' + str(len(missing_plots)) + ' appended at bottom)' if missing_plots else ''}")
+        return "ok"
 
     except BaseException as exc:
         print(f"  [Final Report] Generation failed: {exc}")
+        return "failed"
 
 
 def execute_workspace_on_amd(
@@ -413,6 +394,9 @@ def execute_workspace_on_amd(
     Lifecycle: create/adopt → cloud-init/local-image readiness → upload → run
     containers → download → destroy. The AMD cloud-init payload builds the
     runtime image locally; execution never pulls a Docker image.
+
+    Outputs are downloaded directly into ``workspace.outputs_dir`` (the
+    per-execution run folder's ``outputs/``), so there is no post-run shift.
     """
     if vm_already_selected and not session:
         raise RuntimeError(
@@ -455,22 +439,30 @@ def execute_workspace_on_amd(
                     f"{droplet.base_url}/droplets/{droplet.droplet_id}"
                 )
         else:
-            try:
-                droplet.destroy()
-            except BaseException as cleanup_exc:
-                print(f"Cleanup failed: {cleanup_exc}")
-                if droplet.droplet_id:
+            # Shield destroy from KeyboardInterrupt — a second Ctrl-C MUST NOT
+            # leak the droplet.  We retry destroy indefinitely until it succeeds
+            # or the process is forcibly killed (SIGKILL).
+            destroy_attempts = 0
+            while True:
+                destroy_attempts += 1
+                try:
+                    droplet.destroy()
+                    break  # destroy succeeded
+                except KeyboardInterrupt:
                     print(
-                        f"IMPORTANT: Manually destroy Droplet {droplet.droplet_id} to stop billing!\n"
-                        f"  Destroy: curl -X DELETE -H 'Authorization: Bearer $AMD_TOKEN' "
-                        f"{droplet.base_url}/droplets/{droplet.droplet_id}"
+                        f"\n  Destroy in progress — this stops billing for "
+                        f"Droplet {droplet.droplet_id}. Please wait..."
                     )
-                if run_error is None:
-                    raise
-                print("The original run error above is the important one.")
-
-    # ── Post-execution (reached only if no exception) ────────────────────
-    # Shift outputs/runtime-workspace to project-level directories *after*
-    # the Droplet is destroyed — so cleanup delay never blocks the shift.
-    if local_outputs is not None:
-        _shift_completed_outputs(workspace.job_id)
+                    # Continue the loop — never let Ctrl-C abort destroy
+                except BaseException as cleanup_exc:
+                    print(f"Cleanup failed: {cleanup_exc}")
+                    if droplet.droplet_id:
+                        print(
+                            f"IMPORTANT: Manually destroy Droplet {droplet.droplet_id} to stop billing!\n"
+                            f"  Destroy: curl -X DELETE -H 'Authorization: Bearer $AMD_TOKEN' "
+                            f"{droplet.base_url}/droplets/{droplet.droplet_id}"
+                        )
+                    if run_error is None:
+                        raise
+                    print("The original run error above is the important one.")
+                    break
