@@ -79,9 +79,9 @@ class RemoteHostRunner:
         else:
             self._ssh(ip, f"rm -rf {shlex.quote(remote_job_dir)} && mkdir -p {shlex.quote(remote_job_dir)}")
 
-        print("Uploading job payload to the VM via SSH pipe...")
+        print("  ▸ Uploading job payload...")
         self._upload_archive(ip, workspace, remote_job_dir)
-        print("Job payload uploaded.")
+        print("  ✓ Payload uploaded")
         return remote_job_dir
 
     def _upload_archive(self, ip: str, workspace: JobWorkspace, remote_job_dir: str) -> None:
@@ -108,7 +108,7 @@ class RemoteHostRunner:
     def run_dataset_inspection(self, ip: str, remote_job_dir: str) -> None:
         """Prepare and inspect the dataset on the host natively."""
         self._wait_for_provisioning(ip)
-        print("Downloading datasets to VM ......", flush=True)
+        print("\n  ▸ Downloading datasets to VM...")
         self._run_host_stage(ip, remote_job_dir, "dataset-inspect", "python3 -u dataset_inspector.py", install_packages=True)
 
     def download_dataset_metadata(self, ip: str, workspace: JobWorkspace, remote_job_dir: str) -> Path:
@@ -228,7 +228,7 @@ class RemoteHostRunner:
         if self._remote_python is not None:
             return self._remote_python
 
-        print("  🔎 Probing remote host for a Python with torch...", flush=True)
+        print("  ▸ Checking remote Python environment...", flush=True)
 
         # ── Probe 0: common AMD Quick Start conda path ──
         # The PyTorch Quick Start image (amddevelopercloud-pytorch2100rocm724)
@@ -330,7 +330,6 @@ class RemoteHostRunner:
                         return self._remote_python
 
         # ── Fallback: cache and return default (will fail gracefully later) ──
-        print("  ⚠️  No Python with torch found; will install torch overlay", flush=True)
         self._remote_python = "python3"
         return self._remote_python
 
@@ -351,13 +350,13 @@ class RemoteHostRunner:
                 f"python3 -c 'import torch; print(1)'",
                 capture=True, check=False, timeout_sec=15)
             if check.returncode != 0:
-                print("  📦 Installing ROCm PyTorch to package overlay...", flush=True)
+                print("  ▸ Installing missing packages...", flush=True)
                 # Pre-flight: verify the ROCm wheel index is reachable and
                 # has a wheel for the current Python version before attempting
                 # a large install that will just fail.
                 py_ver_check = self._ssh(ip,
                     "python3 -c 'import sys; print(f\"{sys.version_info.major}.{sys.version_info.minor}\")'",
-                    capture=True, check=False, timeout_sec=15)
+                    capture=True, check=False, timeout_sec=15, print_output=False)
                 rocm_variants = ("rocm7.2", "rocm6.2")
                 install_ok = False
                 last_error = ""
@@ -368,7 +367,7 @@ class RemoteHostRunner:
                         f"python3 -c 'import urllib.request; "
                         f"r = urllib.request.urlopen(\"{index_url}/torch/\", timeout=15); "
                         f"print(r.status)' 2>&1",
-                        capture=True, check=False, timeout_sec=20)
+                        capture=True, check=False, timeout_sec=20, print_output=False)
                     if probe.returncode != 0 or "200" not in (probe.stdout or ""):
                         last_error = f"index {index_url} not reachable (status: {probe.stdout.strip() if probe.stdout else 'timeout'})"
                         print(f"  ⚠️  {last_error}; trying next variant...", flush=True)
@@ -377,19 +376,18 @@ class RemoteHostRunner:
                         install_torch = (
                             f"mkdir -p {overlay} && "
                             f"export PYTHONPATH={qdir}:{overlay} && "
-                            f"pip install torch torchvision torchaudio "
+                            f"pip install -q torch torchvision torchaudio "
                             f"--target {overlay} "
                             f"--index-url {index_url} "
-                            f"--break-system-packages 2>&1"
+                            f"--break-system-packages"
                         )
-                        self._ssh(ip, install_torch, capture=True, check=True, timeout_sec=1200)
+                        self._ssh(ip, install_torch, capture=True, check=True, timeout_sec=1200, print_output=False)
                         # Verify the install actually works
                         py_ver = self._ssh(ip,
                             f"export PYTHONPATH={qdir}:{overlay} && "
                             f"python3 -c 'import torch; print(torch.__version__)'",
-                            capture=True, check=True, timeout_sec=15)
-                        print(f"  ✅ ROCm PyTorch {py_ver.stdout.strip()} installed in overlay "
-                              f"(via {rocm_variant})", flush=True)
+                            capture=True, check=True, timeout_sec=15, print_output=False)
+                        print(f"  ✓ ROCm PyTorch {py_ver.stdout.strip()}", flush=True)
                         install_ok = True
                         break
                     except RuntimeError as exc:
@@ -410,7 +408,7 @@ class RemoteHostRunner:
         self._run_host_stage(ip, remote_job_dir, "runtime",
                              f"{python_cmd} -u runtime_bootstrap.py",
                              install_packages=False)
-        print("Bootstrap execution completed.")
+        print("\n  ✓ Training execution completed")
 
     # ── Output Download ─────────────────────────────────────────────────
 
@@ -678,7 +676,7 @@ class RemoteHostRunner:
         """
         timeout_sec = max(self.settings.wait_ssh_timeout_sec, 60)
         max_attempts = timeout_sec // 10
-        print(f"🔒 Probing VM for SSH handshake availability (timeout {timeout_sec}s)...")
+        print(f"  ▸ Waiting for SSH to be ready...")
         cmd = [
             "ssh", *self._ssh_probe_options(), f"{self.settings.admin_user}@{ip}",
             "echo 'Ready'",
@@ -689,7 +687,7 @@ class RemoteHostRunner:
             except subprocess.TimeoutExpired:
                 result = subprocess.CompletedProcess(cmd, returncode=255, stdout="", stderr="timeout")
             if result.returncode == 0 and "Ready" in result.stdout:
-                print("\n⚡ SSH service is alive and accepting keys!")
+                print("  ✓ SSH ready")
                 return
             print("⏳", end="", flush=True)
             time.sleep(10)
@@ -710,7 +708,7 @@ class RemoteHostRunner:
         """
         timeout_sec = max(self.settings.wait_provisioning_timeout_sec, 60)
         max_attempts = timeout_sec // 10
-        print(f"🛠️ Waiting for AMD system initialization (timeout {timeout_sec}s)...")
+        print(f"  ▸ Waiting for AMD system initialization...")
         cmd = [
             "ssh", *self._ssh_probe_options(), f"{self.settings.admin_user}@{ip}",
             "echo 'SSHD_READY'",
@@ -725,7 +723,7 @@ class RemoteHostRunner:
             output = result.stdout + result.stderr
 
             if "SSHD_READY" in result.stdout and "Please wait" not in output:
-                print("\n✨ AMD environment is completely stable and ready!")
+                print("  ✓ AMD environment ready")
                 return
 
             if "Connection refused" in output:
