@@ -412,14 +412,13 @@ def execute_workspace_on_amd(
         if session:
             droplet.adopt(session.droplet_id)
             ip = session.ip
-            print(f"Reusing existing Droplet {session.droplet_id} at {ip}.")
-            print("Checking SSH access on the selected Droplet...")
+            print(f"  ▸ Reusing existing Droplet {session.droplet_id}")
             droplet.wait_for_ssh(ip)
         else:
             droplet.create_droplet()
             droplet.wait_until_active()
             ip = droplet.get_public_ip()
-        print(f"Droplet public IP: {ip}")
+        print(f"  ✓ Droplet ready at {ip}")
 
         # Upload payload and execute it in the cloud-init-built local image.
         remote_job_dir = host.upload_workspace(ip, workspace, preserve_remote=preserve_remote)

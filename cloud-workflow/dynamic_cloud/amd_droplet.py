@@ -177,9 +177,9 @@ class AmdDropletManager:
         regions = self.settings.regions or (self.settings.region,)
         for region in regions:
             for size in self.settings.vm_sizes:
+                short_size = size.replace("gpu-", "").replace("devcloud", "").strip("-")
                 print(
-                    f"Creating GPU Droplet '{droplet_name}' with plan {size} "
-                    f"in {region} and image {self.settings.gpu_image}..."
+                    f"  ▸ Creating GPU droplet — {short_size} · image: {self.settings.gpu_image}"
                 )
                 try:
                     resp = self._request(
@@ -221,7 +221,7 @@ class AmdDropletManager:
                     droplet_data = response_json["droplet"]
                     self.droplet_id = droplet_data["id"]
                     self.region = region
-                    print(f"Droplet created (ID: {self.droplet_id}, region: {region}, size: {size}).")
+                    print(f"  ✓ Droplet created (ID: {self.droplet_id})")
                     self._assign_project_best_effort()
                     return
                 except requests.exceptions.HTTPError as exc:

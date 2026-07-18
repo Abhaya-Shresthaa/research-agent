@@ -1175,17 +1175,20 @@ def main() -> Path | None:
     ]
 
     if missing:
-        print("Installing missing runtime packages:", ", ".join(missing), flush=True)
+        print(f"Installing missing runtime packages ({len(missing)}): {', '.join(missing)}", flush=True)
         # Do not touch the Python environment baked into the AMD image.
         # In particular, Debian-owned packages have no pip RECORD and cannot
         # be uninstalled safely.  A per-container overlay keeps ROCm and the
         # preinstalled framework intact while still allowing job dependencies.
         PACKAGE_OVERLAY.mkdir(parents=True, exist_ok=True)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--target", str(PACKAGE_OVERLAY), *missing],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "--target", str(PACKAGE_OVERLAY), *missing],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(f"✓ Installed {len(missing)} package(s)", flush=True)
         _activate_overlay()
     else:
-        print("No missing runtime packages to install.", flush=True)
+        print("All runtime packages already available.", flush=True)
 
     return _prepare_dataset()
 
