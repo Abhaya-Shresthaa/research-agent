@@ -404,7 +404,7 @@ You MUST return strict JSON only. Every key below is REQUIRED — omitting any w
       "url": "GitHub URL when applicable",
       "local_paths": [],
       "description": "...",
-      "container_data_dir": "/workspace/data for local, /workspace/prepared_datasets for remote"
+      "container_data_dir": "/workspace/data for local, /workspace/prepared_datasets for remote, OMIT entirely when type is none"
     },
     "runtime": {
       "python_version": "3.11",
@@ -475,6 +475,8 @@ CRITICAL — save_model() sequence: For training jobs you MUST call save_model(m
   model.load_state_dict(torch.load(Path(model_path) / "model.pth"))  # ← load for eval
   evaluate_model(model)
 
+CRITICAL — model persistence: Persist the model ONLY via save_model(model) (which saves state_dict). Do NOT add an extra torch.save(model, <path>) that saves the WHOLE model object — the script is exec'd in a namespace where pickle cannot resolve the model class by reference, so torch.save(model) crashes with PicklingError ("Can't pickle <class '__main__....'>"). If you must write a checkpoint to a specific path, save the state_dict instead: torch.save(model.state_dict(), <path>), and resolve that path from os.environ["DYNAMIC_CLOUD_OUTPUTS_DIR"] (e.g. Path(os.environ["DYNAMIC_CLOUD_OUTPUTS_DIR"]) / "mnist_cnn.pth"). NEVER hardcode an absolute path like "/app/output/...". Reloading must use model.load_state_dict(torch.load(<path>)), never torch.load(<path>) assigned back to the model.
+
 Your generated script MUST import only from the list above. Any hallucinated import will cause a runtime error and waste AMD GPU Cloud resources.
 
 Hard requirements:
@@ -496,7 +498,13 @@ Hard requirements:
   Local -> {"type":"local","local_paths":["/absolute/local/path"],"container_data_dir":"/workspace/data"}
 - generated/script.py must not call wget/curl/git clone/datasets.load_dataset/urllib download/request download logic. Use DATASET_PATH after dataset_manager prepares it.
 - For Hugging Face datasets, dataset_manager saves the dataset to disk; generated/script.py may use datasets.load_from_disk(os.environ["DATASET_PATH"]).
-- If dataset.type is "none", the script may use a framework built-in dataset only when the user explicitly chose that path; otherwise fail early with a clear message explaining what data is required.
+- DATASET_PATH and the /workspace/prepared_datasets directory are ONLY prepared when dataset.type is "huggingface", "github", or "local". They are NEVER set when dataset.type is "none" — dataset_manager skips preparation entirely for "none".
+- When dataset.type is "none" (the user chose "No external dataset / framework built-in"), the script MUST load data from a framework built-in that downloads it itself. Do NOT reference os.environ["DATASET_PATH"], DATASET_PATH, load_from_disk, or /workspace/prepared_datasets — those are absent for "none" and will crash at runtime with KeyError/FileNotFoundError. Instead:
+    * PyTorch: torchvision.datasets.MNIST(root="/workspace/data", download=True, ...) — or CIFAR10/FashionMNIST/KMNIST as appropriate. Pass download=True so the framework fetches the data.
+    * TensorFlow: tf.keras.datasets.mnist.load_data() — or cifar10/cifar100/fashion_mnist as appropriate.
+    * Use the exact built-in the user named (e.g. "MNIST" -> torchvision.datasets.MNIST). If the user did not name one, pick the standard built-in matching the objective and record it in summary.dataset_plan.
+    * Omit job_spec.dataset.container_data_dir entirely for type "none".
+- If dataset.type is "none" but the user genuinely requires a custom/external dataset that is not a framework built-in, do not silently fall back to DATASET_PATH — fail early in the script with a clear message explaining what data source is required.
 - For deep learning, keep the initial run practical unless the user clearly asked for a large run.
 - Include enough printed logs for the remote Docker run to be understandable.
 - Use the selected framework and accelerator exactly as provided by the orchestrator.
@@ -802,7 +810,7 @@ def _select_dataset_source() -> dict[str, Any]:
     prompts = {
         "huggingface": "Enter Hugging Face dataset ID, for example AI-Lab-Makerere/beans",
         "github": "Enter GitHub repo/archive URL",
-        "local": "Enter local dataset path(s), comma-separated if multiple",
+        "local": "Enter local dataset path(s), comma-separated if multiple(press enter if in uploading_data/)",
     }
     value = input(f"\n{prompts[selected_type]}\n> ").strip()
     if not value:

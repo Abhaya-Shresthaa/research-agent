@@ -1307,6 +1307,7 @@ def _runtime_runner_source() -> str:
 import json
 import os
 import sys
+import types
 from pathlib import Path
 
 
@@ -1346,11 +1347,19 @@ def main() -> None:
     # env-propagation bugs across a subprocess boundary.
     code = script.read_text(encoding="utf-8")
     compiled = compile(code, str(script), "exec", dont_inherit=False)
-    globals_ = {
-        "__name__": "__main__",
-        "__file__": str(script),
-        "__builtins__": __builtins__,
-    }
+    # Exec into the *real* __main__ module's namespace (keeping __name__ as
+    # "__main__") so that classes the script defines (e.g. an nn.Module subclass)
+    # are reachable as attributes of sys.modules["__main__"].  Without this,
+    # torch.save(<whole model object>) crashes with PicklingError because pickle
+    # stores the class by reference (module="__main__", qualname=...) and the
+    # class lived only in a throwaway dict.  Saving state_dict still works either
+    # way; this makes whole-object saves work too.  setdefault avoids clobbering
+    # runtime_runner's own globals before the script runs.
+    main_mod = sys.modules.setdefault("__main__", types.ModuleType("__main__"))
+    globals_ = main_mod.__dict__
+    globals_.setdefault("__name__", "__main__")
+    globals_.setdefault("__builtins__", __builtins__)
+    globals_["__file__"] = str(script)
     sys.stdout.flush()
     exec(compiled, globals_)
 

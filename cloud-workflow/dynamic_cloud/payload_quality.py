@@ -33,7 +33,9 @@ Approval rules:
 - When selected_dataset_metadata is present in the context, reject if the script assumes different split folders, class names, label files, or Hugging Face feature names than the inspected metadata provides.
 - Reject if Dockerfile or requirements.txt are generated for the normal layered workflow.
 - Reject if generated/script.py contains dataset download logic. Dataset downloads are handled only by /workspace/dataset_manager.py from payload.json metadata.
+- Reject if dataset.type is "none" but the script references DATASET_PATH, os.environ["DATASET_PATH"], load_from_disk, or /workspace/prepared_datasets. For type "none" the dataset_manager prepares nothing and DATASET_PATH is never set, so those will crash at runtime. The script must instead load a framework built-in that downloads itself (e.g. torchvision.datasets.MNIST(root="/workspace/data", download=True) or tf.keras.datasets.mnist.load_data()).
 - Reject if the script is a training job (detected via .fit(), .backward(), optimizer.step(), train_loader, or epoch parameters) but does NOT call save_model() from the outputs helper. Without save_model(), model.pth is never written and evaluation crashes with FileNotFoundError.
+- Reject if generated/script.py calls torch.save(model, ...) (or any torch.save whose first argument is a bare model object rather than model.state_dict()). The script is exec'd in a namespace where pickle cannot resolve the model class by reference, so saving the whole model crashes with PicklingError. Persist via save_model(model); if a specific checkpoint path is needed, save torch.save(model.state_dict(), <path>) with the path resolved from os.environ["DYNAMIC_CLOUD_OUTPUTS_DIR"], never a hardcoded "/app/output/..." absolute path.
 - Reject if the script has syntax errors, placeholder code, missing /outputs writes, or obvious runtime mistakes.
 - Reject if script imports from the outputs helper any function NOT in this exact list: save_metrics, log_epoch, save_training_history, save_plot, save_model, save_environment.
 - Reject TensorFlow image pipelines that use Dataset.from_generator with output_types instead of output_signature; tf.image.resize needs known image rank/shape.
@@ -60,7 +62,7 @@ Return the full corrected payload as strict JSON only, with this shape:
     "url": "GitHub URL when applicable",
       "local_paths": [],
       "description": "...",
-    "container_data_dir": "/workspace/data for local, /workspace/prepared_datasets for remote"
+    "container_data_dir": "/workspace/data for local, /workspace/prepared_datasets for remote, OMIT entirely when type is none"
     },
     "runtime": {
       "python_version": "3.11",
@@ -116,9 +118,11 @@ Hard rules:
 - Use DATASET_PATH from the environment for prepared datasets. Local data is copied to /workspace/data; remote data is prepared under /workspace/prepared_datasets.
 - If selected_dataset_metadata exists in the context, treat it as ground truth for the real dataset tree, split names, class directories, file extensions, label files, and Hugging Face features. Preserve actual names.
 - For Hugging Face datasets, generated/script.py may call datasets.load_from_disk(os.environ["DATASET_PATH"]), but must not call datasets.load_dataset.
+- For dataset.type "none", generated/script.py MUST NOT reference DATASET_PATH, os.environ["DATASET_PATH"], load_from_disk, or /workspace/prepared_datasets — dataset_manager prepares nothing for "none" and DATASET_PATH is never set, so those crash at runtime. Replace them with a framework built-in that downloads itself: PyTorch torchvision.datasets.MNIST(root="/workspace/data", download=True, ...) (or CIFAR10/FashionMNIST), TensorFlow tf.keras.datasets.mnist.load_data() (or cifar10/cifar100). Use the built-in the user named. Omit job_spec.dataset.container_data_dir for type "none".
 - For TensorFlow image datasets built with tf.data.Dataset.from_generator, use output_signature with an image TensorSpec rank of 3, for example
   (tf.TensorSpec(shape=(None, None, 3), dtype=tf.uint8), tf.TensorSpec(shape=(), dtype=tf.int32)).
   Convert PIL images to RGB in the generator, yield np.asarray(...), then resize/cast in map. Do not use output_types for image generators.
+- Persist models ONLY via save_model(model) (state_dict). Do NOT add torch.save(<whole model object>, ...) — the script is exec'd in a namespace where pickle cannot resolve the model class by reference, so torch.save(model) crashes with PicklingError. If a specific checkpoint path is required, save the state_dict: torch.save(model.state_dict(), <path>) with the path resolved from os.environ["DYNAMIC_CLOUD_OUTPUTS_DIR"]; NEVER hardcode a "/app/output/..." absolute path.
 - Use /outputs for all artifacts.
 - Import and use /workspace/generated/outputs.py helpers — only the six functions listed above.
 - Output only valid JSON. No Markdown.
@@ -263,6 +267,131 @@ def _validate_save_model_call(
             f"FileNotFoundError."))
 
 
+def _is_state_dict_call(node: ast.AST) -> bool:
+    """True for expressions like ``model.state_dict()`` / ``optimizer.state_dict()``."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "state_dict"
+    )
+
+
+def _root_call(node: ast.AST) -> ast.AST:
+    """Unwrap ``X().to(...).half()`` chains to the base ``X()`` call.
+
+    Only descends through method-call layers whose receiver is itself a call, so
+    a plain ``models.resnet18(...)`` (receiver is a Name) is returned unchanged.
+    """
+    cur = node
+    while (
+        isinstance(cur, ast.Call)
+        and isinstance(cur.func, ast.Attribute)
+        and isinstance(cur.func.value, ast.Call)
+    ):
+        cur = cur.func.value
+    return cur
+
+
+def _collect_model_var_names(tree: ast.AST) -> set[str]:
+    """Statically find local variable names that hold a model instance.
+
+    A variable is a model var if it is assigned from a call to a class defined in
+    the script that subclasses ``nn.Module`` / ``tf.keras.Model``, or from a
+    torchvision/torchvision.models / tf.keras.applications factory.  This avoids
+    false-positiving on ``torch.save(<tensor>, ...)``.
+    """
+    model_class_names: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for base in node.bases:
+            bn = _call_name(base)
+            if (
+                bn in {"Module", "nn.Module", "torch.nn.Module", "Model",
+                       "keras.Model", "tf.keras.Model", "tf.keras.Model.Model"}
+                or bn.endswith(".Module")
+                or bn.endswith(".Model")
+            ):
+                model_class_names.add(node.name)
+
+    def is_model_ctor(call: ast.AST) -> bool:
+        if not isinstance(call, ast.Call):
+            return False
+        root = _root_call(call)
+        if not isinstance(root, ast.Call):
+            return False
+        ctor = _call_name(root.func)
+        if ctor in model_class_names:
+            return True
+        if isinstance(root.func, ast.Attribute) and (
+            ctor.startswith("models.")
+            or ctor.startswith("torchvision.models.")
+            or ctor.startswith("tf.keras.applications.")
+            or ctor.endswith(".Model")
+        ):
+            return True
+        return False
+
+    model_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and is_model_ctor(node.value):
+            for tgt in node.targets:
+                if isinstance(tgt, ast.Name):
+                    model_vars.add(tgt.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and is_model_ctor(node.value):
+            model_vars.add(node.target.id)
+    return model_vars
+
+
+def _check_whole_model_torch_save(
+    script: str,
+    issues: list[dict[str, str]],
+    warnings: list[dict[str, str]],
+) -> None:
+    """Reject ``torch.save(<whole model object>, ...)`` for known model vars.
+
+    The generated script is exec'd in a namespace where pickle cannot resolve a
+    script-defined class (e.g. an ``nn.Module`` subclass) by reference, so saving
+    the whole model crashes with ``PicklingError``.  Saving ``model.state_dict()``
+    or a literal container is fine; ``torch.save(<tensor>, ...)`` is intentionally
+    NOT flagged (tensors pickle by value).
+    """
+    try:
+        tree = ast.parse(script)
+    except SyntaxError:
+        return
+
+    model_vars = _collect_model_var_names(tree)
+
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and _call_name(node.func) == "torch.save"):
+            continue
+        if not node.args:
+            continue
+        first = node.args[0]
+        if _is_state_dict_call(first):
+            continue
+        if isinstance(first, (ast.Dict, ast.Tuple, ast.List, ast.Set)):
+            continue
+        if isinstance(first, ast.Call):
+            continue  # container builders, factory outputs wrapped, etc.
+        target_name = None
+        if isinstance(first, ast.Name):
+            target_name = first.id
+        elif isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name):
+            target_name = first.value.id  # e.g. model.module
+        if target_name and target_name in model_vars:
+            issues.append(_issue(
+                "error",
+                f"generated/script.py calls torch.save(<whole model object '{target_name}'>, ...) — saving "
+                "the full model crashes with PicklingError because the model class is defined in the exec'd "
+                "script and pickle cannot resolve it by reference. Persist via save_model(model); if a "
+                "specific checkpoint path is required, save the state_dict: "
+                "torch.save(model.state_dict(), <path>) with the path resolved from "
+                "os.environ['DYNAMIC_CLOUD_OUTPUTS_DIR'], never a hardcoded '/app/output/...' absolute path.",
+            ))
+
+
 def analyze_generated_payload(
     payload: dict[str, Any],
     requirement_context: dict[str, Any] | None = None,
@@ -320,6 +449,7 @@ def analyze_generated_payload(
         _check_tf_data_antipatterns(script, issues, warnings)
         _check_common_import_errors(script, issues)
         _validate_save_model_call(script, job_spec, requirement_context, issues, warnings)
+        _check_whole_model_torch_save(script, issues, warnings)
 
         if "/outputs" not in script and "save_metrics" not in script and "save_environment" not in script:
             issues.append(_issue("error", "Script does not appear to write artifacts to /outputs or use the outputs helper."))
@@ -515,6 +645,40 @@ def _check_dataset_contract(
 
     if dataset_type and dataset_type != "none" and "dataset_path" not in lowered and "data_dir" not in lowered and "os.environ" not in lowered:
         warnings.append(_issue("warning", "Script does not clearly read DATASET_PATH or the prepared dataset directory."))
+
+    # dataset.type == "none" means no external dataset is prepared: dataset_manager
+    # returns None and DATASET_PATH / /workspace/prepared_datasets are NEVER set.
+    # The script must use a framework built-in (torchvision.datasets.* / keras.datasets.*)
+    # and must NOT touch DATASET_PATH or load_from_disk, or it will crash at runtime.
+    if dataset_type == "none":
+        none_forbidden = {
+            "load_from_disk": (
+                'dataset.type is "none" so DATASET_PATH is never set; load_from_disk will crash with '
+                "KeyError/FileNotFoundError. Use a framework built-in that downloads itself, e.g. "
+                "torchvision.datasets.MNIST(root=\"/workspace/data\", download=True, ...) or "
+                "tf.keras.datasets.mnist.load_data()."
+            ),
+            "dataset_path": (
+                'dataset.type is "none" so the DATASET_PATH env var is never set; referencing it will crash. '
+                "Use a framework built-in that downloads itself (torchvision.datasets.* / keras.datasets.*)."
+            ),
+            "prepared_datasets": (
+                'dataset.type is "none" so /workspace/prepared_datasets is never created; referencing it will '
+                "crash with FileNotFoundError. Use a framework built-in that downloads itself "
+                "(torchvision.datasets.* / keras.datasets.*)."
+            ),
+        }
+        for pattern, message in none_forbidden.items():
+            if pattern in lowered:
+                issues.append(_issue("error", f"generated/script.py uses a prepared-dataset path for dataset.type \"none\" ({pattern}): {message}"))
+
+        builtin_markers = ("torchvision.datasets", "keras.datasets", "tf.keras.datasets", "download=true", "download =true", "load_data(")
+        if not any(marker in lowered for marker in builtin_markers):
+            warnings.append(_issue(
+                "warning",
+                'dataset.type is "none" but the script does not reference a framework built-in dataset '
+                "(torchvision.datasets.* / keras.datasets.*). It must load data from a built-in that downloads itself.",
+            ))
 
 
 def _check_tf_data_antipatterns(
