@@ -50,9 +50,10 @@ generated_files/
 !generated_files/.gitkeep
 
 # ── User Resources (uploaded datasets & scripts) ────────────────────────
-user_resources/uploading_data/
+# Ignore everything inside these dirs except the placeholder files
+user_resources/uploading_data/*
 !user_resources/uploading_data/.gitkeep
-user_resources/user_script/
+user_resources/user_script/*
 !user_resources/user_script/.gitkeep
 
 # ── Misc ────────────────────────────────────────────────────────────────
